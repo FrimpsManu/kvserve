@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import torch
 
-from kvserve.attention import AttentionMetadata, get_backend
+from kvserve.attention import AttentionMetadata, TritonAttention, get_backend
 from kvserve.config import EngineConfig, ModelConfig, resolve_model_path
+from kvserve.cuda_graph import DecodeGraphRunner
 from kvserve.kv_cache import KVCacheManager
 from kvserve.model import load_model
 from kvserve.sampler import sample
@@ -27,12 +28,26 @@ class ModelRunner:
         )
         self.num_kv_blocks = config.num_kv_blocks or self._blocks_for_memory(config.kv_cache_memory_gb)
         mc = self.model_config
-        # [layers, k/v, blocks, block_size, kv_heads, head_dim]
+        # [layers, k/v, blocks, block_size, kv_heads, head_dim]. One extra block past the
+        # allocator's pool is scratch space for CUDA-graph padding rows.
+        self.scratch_block = self.num_kv_blocks
         self.kv_caches = torch.zeros(
-            mc.num_layers, 2, self.num_kv_blocks, config.block_size, mc.num_kv_heads, mc.head_dim,
+            mc.num_layers, 2, self.num_kv_blocks + 1, config.block_size, mc.num_kv_heads, mc.head_dim,
             dtype=self.dtype, device=self.device,
         )  # fmt: skip
         self.generator = torch.Generator().manual_seed(config.seed)
+
+        self.graphs: DecodeGraphRunner | None = None
+        if config.enable_cuda_graphs and self.device.type == "cuda" and self.attn_backend is TritonAttention:
+            self.graphs = DecodeGraphRunner(
+                self.model,
+                self.kv_caches,
+                scratch_block=self.scratch_block,
+                block_size=config.block_size,
+                max_batch=min(config.max_graph_batch_size, config.max_num_seqs),
+                max_blocks_per_seq=-(-config.max_model_len // config.block_size),
+            )
+            self.graphs.capture()
 
     def _blocks_for_memory(self, gb: float) -> int:
         mc = self.model_config
@@ -62,11 +77,15 @@ class ModelRunner:
                 sample_rows.append(len(input_ids) - 1)
                 sample_seqs.append(seq)
 
-        meta = self._build_metadata(sched, slots, seq_lens, query_lens)
         dev = self.device
-        hidden = self.model(
-            torch.tensor(input_ids, device=dev), torch.tensor(positions, device=dev), self.kv_caches, meta
-        )
+        if self.graphs is not None and max(query_lens) == 1 and len(query_lens) <= self.graphs.max_batch:
+            tables = [seq.block_table for seq, _ in sched.scheduled]
+            hidden = self.graphs.run(input_ids, positions, slots, tables, seq_lens)
+        else:
+            meta = self._build_metadata(sched, slots, seq_lens, query_lens)
+            hidden = self.model(
+                torch.tensor(input_ids, device=dev), torch.tensor(positions, device=dev), self.kv_caches, meta
+            )
         if not sample_seqs:
             return {}
         logits = self.model.compute_logits(hidden[torch.tensor(sample_rows, device=dev)])

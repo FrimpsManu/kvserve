@@ -97,6 +97,8 @@ class EngineConfig:
     max_model_len: int = 4096  # prompt + output cap per sequence
     enable_prefix_caching: bool = True
     attention_backend: str = "auto"  # auto | torch | triton
+    enable_cuda_graphs: bool = True  # decode steps; needs CUDA + the triton backend
+    max_graph_batch_size: int = 128  # largest decode batch captured (capped at max_num_seqs)
     seed: int = 0
 
     @property
