@@ -1,0 +1,5 @@
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 1, "eager_ms": 11.895003281533718, "graph_ms": 3.952771057374776, "graph_tok_s": 252.98707804851915}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 8, "eager_ms": 12.201561722904444, "graph_ms": 4.638242139481008, "graph_tok_s": 1724.7913669498835}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 32, "eager_ms": 12.883308180607855, "graph_ms": 5.44974850025028, "graph_tok_s": 5871.830598885508}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 64, "eager_ms": 13.260975037701428, "graph_ms": 6.6752689983695745, "graph_tok_s": 9587.628605773327}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 128, "eager_ms": 14.075979380868375, "graph_ms": 8.81151604000479, "graph_tok_s": 14526.444645719606}
