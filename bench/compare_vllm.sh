@@ -32,7 +32,7 @@ wait_healthy 8000; run_suite kvserve 8000; kill $PID; wait $PID 2>/dev/null || t
 echo "== vLLM =="
 /workspace/vllm-env/bin/vllm serve "$MODEL" --port 8001 --max-num-seqs "$MAX_SEQS" \
   --max-num-batched-tokens "$MAX_TOKENS" --max-model-len 4096 --enable-prefix-caching \
-  --kv-cache-memory-bytes "$((KV_GB * 1024 * 1024 * 1024))" --disable-log-requests &
+  --kv-cache-memory-bytes "$((KV_GB * 1024 * 1024 * 1024))" &
 PID=$!
 wait_healthy 8001; run_suite vllm 8001; kill $PID; wait $PID 2>/dev/null || true
 
