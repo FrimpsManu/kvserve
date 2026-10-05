@@ -3,6 +3,7 @@
 #   bash bench/compare_vllm.sh                       (run on the GPU pod after scripts/pod_setup.sh --vllm)
 #   SYSTEMS=vllm OUT=results/x.jsonl bash bench/compare_vllm.sh   (one system, append to existing results)
 #   SYSTEMS="kvserve kvserve-decode-graphs kvserve-eager vllm"     (CUDA-graph ablation)
+#   SYSTEMS="kvserve kvserve-thread vllm"                          (engine process vs thread)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export HF_HOME=${HF_HOME:-/workspace/hf}
@@ -48,9 +49,11 @@ trap '[[ -n "$PID" ]] && kill $PID 2>/dev/null || true' EXIT
 for system in $SYSTEMS; do
   echo "== $system =="
   case $system in
-    kvserve|kvserve-decode-graphs|kvserve-eager)
-      # Ablations: full (decode + piecewise graphs), decode graphs only, no graphs.
+    kvserve|kvserve-thread|kvserve-decode-graphs|kvserve-eager)
+      # Ablations: engine in its own process (default) vs on a server thread; full
+      # (decode + piecewise) graphs vs decode graphs only vs no graphs.
       extra=()
+      [[ $system == kvserve-thread ]] && extra=(--engine-mode thread)
       [[ $system == kvserve-decode-graphs ]] && extra=(--no-enable-piecewise-graphs)
       [[ $system == kvserve-eager ]] && extra=(--no-enable-cuda-graphs)
       port=$KVSERVE_PORT; port_free "$port"

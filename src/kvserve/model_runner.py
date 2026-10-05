@@ -6,7 +6,6 @@ from collections import Counter
 
 import torch
 
-from kvserve import metrics
 from kvserve.attention import AttentionMetadata, TritonAttention, get_backend
 from kvserve.config import EngineConfig, ModelConfig, resolve_model_path
 from kvserve.cuda_graph import DecodeGraphRunner, PiecewiseGraphRunner
@@ -91,7 +90,6 @@ class ModelRunner:
 
     def _count(self, path: str) -> None:
         self.step_paths[path] += 1
-        metrics.steps_total.labels(path).inc()
 
     def _blocks_for_memory(self, gb: float) -> int:
         mc = self.model_config
