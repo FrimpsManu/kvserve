@@ -55,7 +55,7 @@ the engine.
 
 - **Per-reply stats:** time to first token, decode tok/s, and how many prompt tokens
   came from the prefix cache. The second turn of a conversation typically reuses most of
-  the prompt (e.g. 48 of 77 tokens, TTFT 241 ms -> 26 ms on the M5 Pro).
+  the prompt (e.g. 48 of 77 prompt tokens on the second turn).
 - **Live engine panel** (polls `/stats`): throughput over the last 60 s, running and
   waiting sequences, tokens in the last forward pass, KV cache usage, prefix-cache hit rate.
 - **Continuous batching demo:** fire 8/32/64 concurrent requests and watch them share one
