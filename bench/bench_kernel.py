@@ -22,18 +22,30 @@ from test_triton_attention import make_batch  # noqa: E402
 from kvserve.attention import TorchAttention  # noqa: E402
 from kvserve.kernels.paged_attention import paged_attention  # noqa: E402
 
+_L2_FLUSH = None
+
 
 def time_ms(fn, iters: int = 50) -> float:
+    """Median time of `fn` with a cold L2 before every call.
+
+    Without the flush, working sets smaller than L2 (72 MB on an RTX 4090) are served
+    from cache on repeated calls and "exceed" HBM peak bandwidth.
+    """
+    global _L2_FLUSH
+    if _L2_FLUSH is None:
+        _L2_FLUSH = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     for _ in range(5):
         fn()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    start.record()
+    times = []
     for _ in range(iters):
+        _L2_FLUSH.zero_()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
         fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return sorted(times)[len(times) // 2]
 
 
 def main() -> None:
