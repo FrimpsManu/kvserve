@@ -41,3 +41,13 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [project.scripts]
 kvserve = "kvserve.cli:main"
+
+# Linux (GPU pods): CUDA 12.8 wheels run on driver >= 570, which most cloud images ship.
+# Newer default PyPI wheels need a newer driver. macOS keeps the default (MPS) wheels.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

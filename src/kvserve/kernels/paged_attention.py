@@ -41,6 +41,7 @@ def _paged_attention_kernel(
     BLOCK_SIZE: tl.constexpr,  # tokens per KV page
     HEAD_DIM: tl.constexpr,
     HEAD_DIM_PAD: tl.constexpr,
+    IEEE: tl.constexpr,  # exact fp32 dots (no TF32); used for fp32 correctness runs
 ):  # fmt: skip
     seq = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -88,7 +89,11 @@ def _paged_attention_kernel(
             mask=kv_mask, other=0.0,
         )  # fmt: skip
 
-        s = tl.dot(q, tl.trans(k)) * qk_scale  # [M, BLOCK_SIZE]
+        if IEEE:  # noqa: SIM108 (compile-time branch inside a Triton kernel)
+            s = tl.dot(q, tl.trans(k), input_precision="ieee")
+        else:
+            s = tl.dot(q, tl.trans(k))
+        s = s * qk_scale  # [M, BLOCK_SIZE]
         causal = k_pos[None, :] <= q_pos[:, None]
         s = tl.where(causal, s, float("-inf"))
 
@@ -98,7 +103,11 @@ def _paged_attention_kernel(
         p = tl.math.exp2(s - m_safe[:, None])
         alpha = tl.math.exp2(m_i - m_safe)
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        if IEEE:  # noqa: SIM108 (compile-time branch inside a Triton kernel)
+            pv = tl.dot(p.to(v.dtype), v, input_precision="ieee")
+        else:
+            pv = tl.dot(p.to(v.dtype), v)
+        acc = acc * alpha[:, None] + pv
         m_i = m_new
 
     out = acc / tl.where(l_i == 0, 1.0, l_i)[:, None]
@@ -139,7 +148,7 @@ def paged_attention(
         out.stride(0), out.stride(1),
         block_tables.stride(0),
         GROUP=group, BLOCK_Q=block_q, BLOCK_SIZE=block_size,
-        HEAD_DIM=head_dim, HEAD_DIM_PAD=triton.next_power_of_2(head_dim),
+        HEAD_DIM=head_dim, HEAD_DIM_PAD=triton.next_power_of_2(head_dim), IEEE=q.dtype == torch.float32,
         num_warps=4, num_stages=2,
     )  # fmt: skip
     return out

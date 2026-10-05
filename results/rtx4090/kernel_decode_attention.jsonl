@@ -1,0 +1,14 @@
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 1, "ctx": 512, "triton_ms": 0.030719999223947525, "torch_ms": 0.14131200313568115, "gbps": 34.133334195613884, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 1, "ctx": 2048, "triton_ms": 0.10751999914646149, "torch_ms": 0.2242559939622879, "gbps": 39.00952411919765, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 1, "ctx": 8192, "triton_ms": 0.4126720130443573, "torch_ms": 0.6000639796257019, "gbps": 40.65508556354814, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 8, "ctx": 512, "triton_ms": 0.035840000957250595, "torch_ms": 0.19148799777030945, "gbps": 234.05713660571055, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 8, "ctx": 2048, "triton_ms": 0.11468800157308578, "torch_ms": 0.5488640069961548, "gbps": 292.5714245584546, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 8, "ctx": 8192, "triton_ms": 0.43513599038124084, "torch_ms": 1.7827839851379395, "gbps": 308.4500730045479, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 32, "ctx": 512, "triton_ms": 0.060416001826524734, "torch_ms": 0.5683199763298035, "gbps": 555.3898137176703, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 32, "ctx": 2048, "triton_ms": 0.20787200331687927, "torch_ms": 1.8431999683380127, "gbps": 645.6748665446737, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 32, "ctx": 8192, "triton_ms": 0.6492159962654114, "torch_ms": 6.670080184936523, "gbps": 826.9526861450242, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 64, "ctx": 512, "triton_ms": 0.10841599851846695, "torch_ms": 1.0362880229949951, "gbps": 618.9941052709952, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 64, "ctx": 2048, "triton_ms": 0.34694400429725647, "torch_ms": 3.5174400806427, "gbps": 773.7140653106906, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 64, "ctx": 8192, "triton_ms": 1.1929600238800049, "torch_ms": 13.150208473205566, "gbps": 900.065218034501, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 128, "ctx": 512, "triton_ms": 0.21094399690628052, "torch_ms": 1.9046399593353271, "gbps": 636.2718539918018, "peak_gbps": 1008.0}
+{"gpu": "NVIDIA GeForce RTX 4090", "batch": 128, "ctx": 2048, "triton_ms": 0.6338559985160828, "torch_ms": 6.8587517738342285, "gbps": 846.9919244384623, "peak_gbps": 1008.0}

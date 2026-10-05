@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from kvserve import EngineConfig, LLMEngine, SamplingParams
+from kvserve.attention import triton_available
 
 pytestmark = pytest.mark.slow
 
@@ -79,6 +80,17 @@ def test_prefix_caching_hits_and_is_exact(reference):
 
     cold = make_engine(block_size=4, enable_prefix_caching=False)
     assert first + rest == cold.generate(prompts, GREEDY)
+
+
+@pytest.mark.skipif(not triton_available(), reason="needs CUDA + triton")
+def test_triton_backend_matches_hf(reference):
+    eng = LLMEngine(EngineConfig(device="cuda", dtype="float32", attention_backend="triton", num_kv_blocks=256))
+    assert eng.generate(PROMPTS, GREEDY) == reference
+    # Mixed prefill/decode steps and chunked prefill through the kernel.
+    chunked = LLMEngine(
+        EngineConfig(device="cuda", dtype="float32", attention_backend="triton", max_num_batched_tokens=5)
+    )
+    assert chunked.generate(PROMPTS, GREEDY) == reference
 
 
 def test_sampling_is_seeded_and_respects_max_tokens():
