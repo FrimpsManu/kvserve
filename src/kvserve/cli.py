@@ -40,6 +40,12 @@ def main() -> None:
     serve = sub.add_parser("serve", help="run the OpenAI-compatible server")
     serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument(
+        "--engine-mode",
+        choices=["process", "thread"],
+        default="process",
+        help="run the engine in its own process (default) or on a thread of the server process",
+    )
     _add_engine_args(serve)
     args = parser.parse_args()
 
@@ -55,7 +61,7 @@ def main() -> None:
     from kvserve.server import create_app
 
     display_host = "localhost" if args.host in ("0.0.0.0", "::") else args.host
-    app = create_app(config, url=f"http://{display_host}:{args.port}")
+    app = create_app(config, url=f"http://{display_host}:{args.port}", engine_mode=args.engine_mode)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

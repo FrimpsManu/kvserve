@@ -15,9 +15,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
-from kvserve.async_engine import AsyncLLMEngine
+from kvserve.async_engine import EngineClient, ThreadEngineClient
 from kvserve.config import EngineConfig
+from kvserve.detokenizer import IncrementalDetokenizer
 from kvserve.engine import RequestOutput
+from kvserve.engine_client import ProcessEngineClient
 from kvserve.sequence import SamplingParams
 
 
@@ -62,41 +64,37 @@ class ChatCompletionRequest(_SamplingFields):
     max_completion_tokens: int | None = Field(default=None, ge=1)
 
 
-class IncrementalDetokenizer:
-    """Turns a growing token list into text deltas without splitting multi-byte characters."""
-
-    def __init__(self, tokenizer: Any):
-        self.tokenizer = tokenizer
-        self.text = ""
-
-    def delta(self, token_ids: list[int], final: bool) -> str:
-        text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
-        if text.endswith("�") and not final:  # incomplete UTF-8 sequence; wait for more
-            return ""
-        out, self.text = text[len(self.text) :], text
-        return out
-
-
-def startup_banner(engine: AsyncLLMEngine, url: str) -> str:
-    runner = engine.engine.runner
-    kv_tokens = runner.num_kv_blocks * engine.config.block_size
-    graphs = f"decode batch <= {runner.graphs.max_batch}" if runner.graphs else "off"
+def startup_banner(engine: EngineClient, url: str) -> str:
+    info = engine.info
+    graphs = "off"
+    if info["cuda_graphs"]:
+        graphs = f"decode batch <= {info['cuda_graphs']}"
+        if info["piecewise_graphs"]:
+            graphs += f", piecewise <= {info['piecewise_graphs']} tokens"
     return (
         f"kvserve ready at {url}\n"
-        f"  model     {engine.config.model}\n"
-        f"  device    {engine.config.device} ({str(runner.dtype).removeprefix('torch.')}), "
-        f"attention: {runner.attn_backend.__name__}, cuda graphs: {graphs}\n"
-        f"  kv cache  {runner.num_kv_blocks} blocks x {engine.config.block_size} = {kv_tokens:,} tokens\n"
+        f"  model     {info['model']}\n"
+        f"  device    {info['device']} ({info['dtype']}), attention: {info['attention']}, cuda graphs: {graphs}\n"
+        f"  kv cache  {info['kv_blocks']} blocks x {info['block_size']} = {info['kv_capacity_tokens']:,} tokens\n"
+        f"  engine    {engine.mode} mode\n"
         f"  try       {url}/docs   (interactive API)   {url}/metrics"
     )
 
 
-def create_app(config: EngineConfig, url: str | None = None) -> FastAPI:
-    state: dict[str, AsyncLLMEngine] = {}
+def create_app(config: EngineConfig, url: str | None = None, engine_mode: str = "process") -> FastAPI:
+    """engine_mode: "process" runs the engine in its own process (default); "thread" runs
+    it on a thread of the server process."""
+    if engine_mode not in ("process", "thread"):
+        raise ValueError(f"unknown engine mode {engine_mode!r}")
+    state: dict[str, EngineClient] = {}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
-        state["engine"] = AsyncLLMEngine(config)
+        if engine_mode == "process":
+            state["engine"] = await ProcessEngineClient.create(config)
+        else:
+            state["engine"] = ThreadEngineClient(config)
+        app.state.engine = state["engine"]
         if url:
             print(startup_banner(state["engine"], url), flush=True)
         yield
@@ -105,7 +103,7 @@ def create_app(config: EngineConfig, url: str | None = None) -> FastAPI:
     app = FastAPI(title="kvserve", lifespan=lifespan)
     model_name = config.model
 
-    def engine() -> AsyncLLMEngine:
+    def engine() -> EngineClient:
         return state["engine"]
 
     demo_page = resources.files("kvserve").joinpath("static/index.html").read_text()
@@ -118,16 +116,8 @@ def create_app(config: EngineConfig, url: str | None = None) -> FastAPI:
     async def stats() -> dict:
         """Live engine counters for the demo dashboard."""
         eng = engine()
-        runner = eng.engine.runner
-        info = {
-            "model": eng.config.model,
-            "device": eng.config.device,
-            "dtype": str(runner.dtype).removeprefix("torch."),
-            "attention": runner.attn_backend.__name__,
-            "cuda_graphs": runner.graphs.max_batch if runner.graphs else None,
-            "kv_capacity_tokens": runner.num_kv_blocks * eng.config.block_size,
-        }
-        return eng.stats.snapshot() | {"info": info, "step_paths": dict(runner.step_paths)}
+        snapshot = eng.telemetry.stats.snapshot()
+        return snapshot | {"info": eng.info, "engine_mode": eng.mode, "step_paths": eng.telemetry.step_paths}
 
     @app.get("/health")
     async def health() -> Response:
