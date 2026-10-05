@@ -79,11 +79,12 @@ class IncrementalDetokenizer:
 def startup_banner(engine: AsyncLLMEngine, url: str) -> str:
     runner = engine.engine.runner
     kv_tokens = runner.num_kv_blocks * engine.config.block_size
+    graphs = f"decode batch <= {runner.graphs.max_batch}" if runner.graphs else "off"
     return (
         f"kvserve ready at {url}\n"
         f"  model     {engine.config.model}\n"
         f"  device    {engine.config.device} ({str(runner.dtype).removeprefix('torch.')}), "
-        f"attention: {runner.attn_backend.__name__}\n"
+        f"attention: {runner.attn_backend.__name__}, cuda graphs: {graphs}\n"
         f"  kv cache  {runner.num_kv_blocks} blocks x {engine.config.block_size} = {kv_tokens:,} tokens\n"
         f"  try       {url}/docs   (interactive API)   {url}/metrics"
     )
