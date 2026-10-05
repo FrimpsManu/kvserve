@@ -5,7 +5,7 @@ import torch
 
 from kvserve import EngineConfig, LLMEngine, SamplingParams
 from kvserve.attention import triton_available
-from kvserve.cuda_graph import capture_sizes
+from kvserve.cuda_graph import capture_sizes, piecewise_sizes
 
 pytestmark = pytest.mark.skipif(not triton_available(), reason="needs CUDA + triton")
 
@@ -23,6 +23,13 @@ def test_capture_sizes():
     assert capture_sizes(8) == [1, 2, 4, 8]
     assert capture_sizes(40) == [1, 2, 4, 8, 16, 32, 40]
     assert capture_sizes(128)[-3:] == [96, 112, 128]
+
+
+def test_piecewise_sizes():
+    sizes = piecewise_sizes(2048)
+    assert sizes[:5] == [1, 2, 4, 8, 16] and sizes[-1] == 2048
+    assert sizes == sorted(set(sizes))
+    assert piecewise_sizes(100)[-1] == 100 and piecewise_sizes(3)[-1] == 3
 
 
 def make(graphs: bool, **kw) -> LLMEngine:
@@ -98,4 +105,44 @@ def test_matches_hf_with_graphs():
     for prompt, out in zip(PROMPTS[:4], ours, strict=True):
         ids = eng.tokenizer(prompt, return_tensors="pt").input_ids
         ref = hf.generate(ids, max_new_tokens=20, min_new_tokens=20, do_sample=False)[0, ids.shape[1] :]
+        assert out == ref.tolist()
+
+
+@pytest.mark.slow
+def test_piecewise_matches_eager_on_mixed_steps():
+    """A 24-token budget forces chunked prefill steps that mix with decodes; every step
+    must go through graphs and produce the same tokens as eager execution."""
+    params = SamplingParams(temperature=0, max_tokens=12, ignore_eos=True)
+
+    def run(eng: LLMEngine) -> list[list[int]]:
+        ids = []
+        for p in PROMPTS:  # staggered arrivals: new prompts join a running batch
+            ids.append(eng.add_request(p * 3, params))
+            eng.step()
+        out = {}
+        while eng.has_unfinished():
+            for o in eng.step():
+                if o.finished:
+                    out[o.request_id] = o.output_token_ids
+        return [out[i] for i in ids]
+
+    eager = run(make(False, dtype="float32", max_num_batched_tokens=24))
+    eng = make(True, dtype="float32", max_num_batched_tokens=24)
+    assert run(eng) == eager
+    paths = eng.runner.step_paths
+    assert paths["piecewise"] > 0 and paths["decode_graph"] > 0 and paths["eager"] == 0, paths
+
+
+@pytest.mark.slow
+def test_piecewise_matches_hf():
+    from transformers import AutoModelForCausalLM
+
+    eng = make(True, dtype="float32", max_num_batched_tokens=7, max_graph_batch_size=1)
+    greedy = SamplingParams(temperature=0, max_tokens=10, ignore_eos=True)
+    ours = eng.generate(PROMPTS[:3], greedy)  # batch of 3 > decode graph max -> piecewise
+    assert eng.runner.step_paths["piecewise"] > 0
+    hf = AutoModelForCausalLM.from_pretrained(eng.runner.model_path, dtype=torch.float32).eval()
+    for prompt, out in zip(PROMPTS[:3], ours, strict=True):
+        ids = eng.tokenizer(prompt, return_tensors="pt").input_ids
+        ref = hf.generate(ids, max_new_tokens=10, min_new_tokens=10, do_sample=False)[0, ids.shape[1] :]
         assert out == ref.tolist()

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import torch
 
+from kvserve import metrics
 from kvserve.attention import AttentionMetadata, TritonAttention, get_backend
 from kvserve.config import EngineConfig, ModelConfig, resolve_model_path
-from kvserve.cuda_graph import DecodeGraphRunner
+from kvserve.cuda_graph import DecodeGraphRunner, PiecewiseGraphRunner
 from kvserve.kv_cache import KVCacheManager
 from kvserve.model import load_model
 from kvserve.sampler import sample
@@ -37,8 +40,13 @@ class ModelRunner:
         )  # fmt: skip
         self.generator = torch.Generator().manual_seed(config.seed)
 
+        self.step_paths: Counter[str] = Counter()  # decode_graph | piecewise | eager
         self.graphs: DecodeGraphRunner | None = None
+        self.piecewise: PiecewiseGraphRunner | None = None
         if config.enable_cuda_graphs and self.device.type == "cuda" and self.attn_backend is TritonAttention:
+            if config.enable_piecewise_graphs:
+                self.piecewise = PiecewiseGraphRunner(self.model, config.max_num_batched_tokens)
+                self.piecewise.capture()
             self.graphs = DecodeGraphRunner(
                 self.model,
                 self.kv_caches,
@@ -48,6 +56,10 @@ class ModelRunner:
                 max_blocks_per_seq=-(-config.max_model_len // config.block_size),
             )
             self.graphs.capture()
+
+    def _count(self, path: str) -> None:
+        self.step_paths[path] += 1
+        metrics.steps_total.labels(path).inc()
 
     def _blocks_for_memory(self, gb: float) -> int:
         mc = self.model_config
@@ -70,7 +82,7 @@ class ModelRunner:
             tokens = seq.token_ids
             input_ids += tokens[start : start + n]
             positions += range(start, start + n)
-            slots += (kv.slot(seq, p) for p in range(start, start + n))
+            slots += kv.slots(seq, start, n)
             seq_lens.append(start + n)
             query_lens.append(n)
             if start + n == seq.num_tokens:  # chunked prefill not done yet -> no sample
@@ -81,11 +93,17 @@ class ModelRunner:
         if self.graphs is not None and max(query_lens) == 1 and len(query_lens) <= self.graphs.max_batch:
             tables = [seq.block_table for seq, _ in sched.scheduled]
             hidden = self.graphs.run(input_ids, positions, slots, tables, seq_lens)
+            self._count("decode_graph")
+        elif self.piecewise is not None and len(input_ids) <= self.piecewise.max_tokens:
+            meta = self._build_metadata(sched, slots, seq_lens, query_lens)
+            hidden = self.piecewise.run(input_ids, positions, self.kv_caches, meta)
+            self._count("piecewise")
         else:
             meta = self._build_metadata(sched, slots, seq_lens, query_lens)
             hidden = self.model(
                 torch.tensor(input_ids, device=dev), torch.tensor(positions, device=dev), self.kv_caches, meta
             )
+            self._count("eager")
         if not sample_seqs:
             return {}
         logits = self.model.compute_logits(hidden[torch.tensor(sample_rows, device=dev)])
@@ -99,21 +117,23 @@ class ModelRunner:
         max_blocks = max(len(seq.block_table) for seq, _ in sched.scheduled)
         tables = [seq.block_table + [0] * (max_blocks - len(seq.block_table)) for seq, _ in sched.scheduled]
         max_q = max(query_lens)
-        q_gather, q_valid, offset = [], [], 0
         query_start_loc = [0]
         for n in query_lens:
-            q_gather.append(list(range(offset, offset + n)) + [0] * (max_q - n))
-            q_valid.append([True] * n + [False] * (max_q - n))
-            offset += n
-            query_start_loc.append(offset)
-        return AttentionMetadata(
+            query_start_loc.append(query_start_loc[-1] + n)
+        meta = AttentionMetadata(
             slot_mapping=torch.tensor(slots, dtype=torch.long, device=dev),
             block_tables=torch.tensor(tables, dtype=torch.long, device=dev),
             seq_lens=torch.tensor(seq_lens, device=dev),
             query_lens=torch.tensor(query_lens, device=dev),
-            q_gather=torch.tensor(q_gather, dtype=torch.long, device=dev),
-            q_valid=torch.tensor(q_valid, device=dev),
             query_start_loc=torch.tensor(query_start_loc, device=dev),
             max_seq_len=max(seq_lens),
             max_query_len=max_q,
         )
+        if self.attn_backend is not TritonAttention:  # padded layout for the torch reference only
+            q_gather, q_valid = [], []
+            for start, n in zip(query_start_loc, query_lens, strict=False):
+                q_gather.append(list(range(start, start + n)) + [0] * (max_q - n))
+                q_valid.append([True] * n + [False] * (max_q - n))
+            meta.q_gather = torch.tensor(q_gather, dtype=torch.long, device=dev)
+            meta.q_valid = torch.tensor(q_valid, device=dev)
+        return meta
