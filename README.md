@@ -2,8 +2,10 @@
 
 An LLM inference engine built from first principles: paged KV cache, continuous
 batching with chunked prefill, prefix caching, recompute preemption, a Triton
-paged-attention kernel, and an OpenAI-compatible streaming server with Prometheus
-metrics. Benchmarked head-to-head against vLLM on the same GPU.
+paged-attention kernel, decode and piecewise CUDA graphs, and an OpenAI-compatible
+streaming server whose engine runs in its own process. Benchmarked head-to-head against
+vLLM on the same GPU: **98-100% of vLLM's goodput up to 32 req/s and 87% of its burst
+throughput** on an RTX 4090 (Ryzen 9 7950X host).
 
 Every scheduling optimisation is verified to be **output-invariant**: generations are
 token-for-token identical to Hugging Face `transformers` under batching, chunked
@@ -12,26 +14,28 @@ prefill, preemption and prefix caching.
 ## Architecture
 
 ```
- HTTP clients ──► FastAPI server (OpenAI API, SSE streaming, /metrics)
-                        │  asyncio queues
-                        ▼
-                 AsyncLLMEngine ── dedicated engine thread (no locks on engine state)
-                        │
-                        ▼
-                    LLMEngine: schedule ─► execute ─► sample ─► update
-                     │                 │
-          ┌──────────┘                 └──────────┐
-          ▼                                       ▼
-      Scheduler                              ModelRunner
-  token budget per step,              flat (unpadded) token batch,
-  decode-first, chunked prefill,      attention metadata, sampling
-  recompute preemption                          │
-          │                                     ▼
-          ▼                              Llama model (fused QKV / gate-up)
-   KVCacheManager                               │
-  block allocator, block tables,                ▼
-  ref counts, chained-hash             Paged attention backend
-  prefix cache, LRU eviction           (Triton kernel on CUDA; torch reference)
+ HTTP clients
+      │
+      ▼
+ ┌───────────────────────── API server process ─────────────────────────┐
+ │ FastAPI: OpenAI API, SSE streaming, /metrics, /stats, demo page        │
+ │ ProcessEngineClient: tokenize, O(1) incremental detokenize, telemetry  │
+ └───────────────▲─────────────────────────────────────┬─────────────────┘
+                 │ one message per step:               │ add / abort
+                 │ all requests' new tokens + stats    │ (ZeroMQ IPC)
+ ┌───────────────┴──────────── engine process ─────────▼─────────────────┐
+ │ LLMEngine: schedule ─► execute ─► sample ─► update                     │
+ │                                                                        │
+ │  Scheduler                         ModelRunner                         │
+ │  token budget per step,            decode CUDA graphs │ piecewise      │
+ │  decode-first, chunked prefill,    graphs │ eager, flat token batch    │
+ │  recompute preemption                         │                        │
+ │      │                             Llama model (fused QKV / gate-up),  │
+ │  KVCacheManager                    split into pieces around attention  │
+ │  block tables, ref counts,                    │                        │
+ │  chained-hash prefix cache,        Triton paged attention (torch ref.  │
+ │  LRU eviction                      on CPU/MPS)                         │
+ └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key design decisions
@@ -43,7 +47,8 @@ prefill, preemption and prefix caching.
 | Fixed-size KV blocks + block tables | No contiguous allocation per sequence; waste is at most one partial block per sequence |
 | Chained SHA-256 block hashes for prefix caching | A block hit implies the whole prefix matches; freed blocks stay cached until LRU eviction |
 | Recompute (not swap) preemption | Simple and cheap with prefix caching; no CPU swap space to manage |
-| Engine on its own thread, commands via queue | GPU work never blocks the event loop; engine state is single-threaded |
+| Engine in its own process, ZeroMQ IPC, one message per step | API server and engine no longer share a GIL; IPC cost scales with steps, not tokens x requests (`--engine-mode thread` keeps the single-process design) |
+| CUDA graphs: full graphs for decode, piecewise graphs around attention for mixed steps | Decode was launch bound (~300 kernel launches per step); piecewise graphs extend that to steps mixing prefill and decode |
 | Fused QKV and gate/up projections | Fewer, larger GEMMs: better hardware utilisation |
 
 ## Demo
@@ -158,7 +163,41 @@ Past ~512 tokens a step is compute bound, so piecewise graphs cover steps up to
 `--max-piecewise-tokens` (default 512) and larger steps run eagerly. Capture: 408
 graphs, about 1 s at startup.
 
-### Serving: kvserve vs. vLLM 0.31
+### Serving: engine process vs. thread vs. vLLM 0.31
+
+The latest results, all on one pod: RTX 4090 with an AMD Ryzen 9 7950X host. kvserve
+is still partly CPU bound, so this fast desktop CPU flatters both kvserve modes; the
+process-vs-thread comparison is the like-for-like number. Same settings as below.
+
+| Scenario (in/out tokens) | System | Output tok/s | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) | Goodput (req/s) |
+|---|---|---|---|---|---|
+| 512/128, burst | kvserve | **6639** | 2221 / 4133 | 11.3 / 12.8 | 20.26 |
+| | kvserve thread | 5475 | 2576 / 4949 | 14.8 / 16.5 | 15.20 |
+| | vLLM | 7673 | 1953 / 3645 | 8.5 / 11.0 | 23.42 |
+| 512/128, 4 req/s | kvserve | 453 | 15 / 29 | 4.5 / 4.9 | 3.54 |
+| | kvserve thread | 453 | 16 / 28 | 4.8 / 5.3 | 3.54 |
+| | vLLM | 453 | 15 / 23 | 3.4 / 3.6 | 3.54 |
+| 512/128, 16 req/s | kvserve | 1759 | 10 / 16 | 4.8 / 5.0 | 13.75 |
+| | kvserve thread | 1755 | 11 / 18 | 5.3 / 5.7 | 13.71 |
+| | vLLM | 1775 | 12 / 15 | 3.5 / 3.7 | 13.87 |
+| 512/128, 32 req/s | kvserve | 3376 | 11 / 18 | 5.1 / 5.3 | **26.38** |
+| | kvserve thread | 3353 | 14 / 23 | 6.1 / 6.7 | 26.20 |
+| | vLLM | 3432 | 13 / 18 | 3.7 / 3.9 | 26.82 |
+| 1024/128, 768 shared prefix, 16 req/s | kvserve | 1751 | 14 / 22 | 5.3 / 5.6 | 13.68 |
+| | kvserve thread | 1746 | 14 / 24 | 5.9 / 6.3 | 13.64 |
+| | vLLM | 1767 | 15 / 20 | 3.7 / 4.0 | 13.80 |
+
+(8 req/s in the raw data: equal goodput, TPOT 4.6 vs 4.9 vs 3.4 ms.)
+
+- **Burst: +21% from the engine process** (6,639 vs 5,475 tok/s), reaching 87% of vLLM.
+- **Stable across restarts:** three fresh servers per mode measured 6,608 / 6,608 / 6,623
+  tok/s (process) and 5,521 / 5,466 / 5,509 (thread), versus ~35% swings between restarts
+  in the single-process design on an EPYC host
+  ([`burst_restarts.jsonl`](results/rtx4090_ryzen7950x/burst_restarts.jsonl)).
+- **Up to 32 req/s:** 98-100% of vLLM's goodput with equal TTFT; TPOT is 1.1-1.6 ms
+  higher than vLLM.
+
+### Serving ablation: CUDA graphs (EPYC 7642 host)
 
 `bench/compare_vllm.sh`: all systems on one pod (RTX 4090, EPYC 7642), same model,
 `max_num_seqs=128`, `max_num_batched_tokens=2048`, 8 GB KV cache, prefix caching on,
@@ -194,7 +233,8 @@ piecewise graphs), **decode graphs** (`--no-enable-piecewise-graphs`), **eager**
 (up from 37% with decode graphs alone), with p99 TTFT at 32 req/s down from 2.9 s to
 0.5 s.
 
-**Burst (all 256 requests at once) is a serving-layer problem, not an engine one.**
+**Burst (all 256 requests at once) is a serving-layer problem, not an engine one**
+(fixed since by running the engine in its own process, see above).
 Offline, the engine finishes the same burst at 6,730-6,980 tok/s, on par with vLLM's
 served ~6,700. Over HTTP it reaches 2,500-3,600 tok/s, varying by up to ~35% across
 server restarts (run-to-run variance within one server instance is ~2%; raw data in
@@ -261,7 +301,7 @@ that the allocator never leaks or double-frees blocks.
 - [x] NVIDIA benchmarks vs. vLLM, with per-step profiling of the gap
 - [x] CUDA Graphs for decode: 3.95 ms/step at batch 1 (3.0x), 96-100% of vLLM goodput at moderate load
 - [x] Piecewise CUDA graphs for mixed prefill/decode steps: 77% of vLLM goodput at 32 req/s (from 37%)
-- [ ] Engine in its own process (API server and engine no longer share a GIL); O(1) incremental detokenisation
+- [x] Engine in its own process + O(1) incremental detokenisation: +21% burst throughput, 87% of vLLM
 - [ ] Split-KV decode for small batches / long contexts
 - [ ] Tensor parallelism (NCCL)
 - [ ] Go gateway, KV-cache-aware router, disaggregated prefill/decode
