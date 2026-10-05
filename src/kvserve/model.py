@@ -71,8 +71,9 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, backend: type[TorchAttention]):
         super().__init__()
+        self.backend = backend
         self.num_heads, self.num_kv_heads, self.head_dim = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
         self.q_size = cfg.num_heads * cfg.head_dim
         self.kv_size = cfg.num_kv_heads * cfg.head_dim
@@ -95,8 +96,8 @@ class Attention(nn.Module):
         v = v.view(n, self.num_kv_heads, self.head_dim)
         q, k = rope(q, k, positions)
         k_cache, v_cache = kv_cache[0], kv_cache[1]
-        TorchAttention.write_kv(k_cache, v_cache, k, v, meta.slot_mapping)
-        out = TorchAttention.forward(q, k_cache, v_cache, meta, self.scale)
+        self.backend.write_kv(k_cache, v_cache, k, v, meta.slot_mapping)
+        out = self.backend.forward(q, k_cache, v_cache, meta, self.scale)
         return self.o_proj(out.reshape(n, self.q_size))
 
 
@@ -112,10 +113,10 @@ class MLP(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, backend: type[TorchAttention]):
         super().__init__()
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.self_attn = Attention(cfg)
+        self.self_attn = Attention(cfg, backend)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = MLP(cfg)
 
@@ -125,11 +126,11 @@ class DecoderLayer(nn.Module):
 
 
 class LlamaForCausalLM(nn.Module):
-    def __init__(self, cfg: ModelConfig, max_positions: int):
+    def __init__(self, cfg: ModelConfig, max_positions: int, backend: type[TorchAttention] = TorchAttention):
         super().__init__()
         self.cfg = cfg
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.layers = nn.ModuleList(DecoderLayer(cfg) for _ in range(cfg.num_layers))
+        self.layers = nn.ModuleList(DecoderLayer(cfg, backend) for _ in range(cfg.num_layers))
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
@@ -190,9 +191,16 @@ class LlamaForCausalLM(nn.Module):
         return (shard * c.intermediate_size, c.intermediate_size)
 
 
-def load_model(path: Path, cfg: ModelConfig, device: str, dtype: torch.dtype, max_positions: int) -> LlamaForCausalLM:
+def load_model(
+    path: Path,
+    cfg: ModelConfig,
+    device: str,
+    dtype: torch.dtype,
+    max_positions: int,
+    backend: type[TorchAttention] = TorchAttention,
+) -> LlamaForCausalLM:
     with torch.device("meta"):
-        model = LlamaForCausalLM(cfg, max_positions)
+        model = LlamaForCausalLM(cfg, max_positions, backend)
     model = model.to_empty(device=device).to(dtype)
     if cfg.tie_word_embeddings:
         model.lm_head.weight = model.embed_tokens.weight
