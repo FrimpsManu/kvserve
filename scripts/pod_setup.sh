@@ -16,7 +16,8 @@ uv run python -c "from kvserve.config import resolve_model_path, DEFAULT_MODEL; 
 
 if [[ "${1:-}" == "--vllm" ]]; then
   uv venv /workspace/vllm-env --python 3.12
-  VIRTUAL_ENV=/workspace/vllm-env uv pip install vllm
+  # ninja: vLLM JIT-compiles some kernels (e.g. FlashInfer) at startup.
+  VIRTUAL_ENV=/workspace/vllm-env uv pip install vllm ninja
   /workspace/vllm-env/bin/python -c "import vllm; print('vllm', vllm.__version__)"
 fi
 echo "setup done. export HF_HOME=$HF_HOME"

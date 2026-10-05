@@ -54,7 +54,7 @@ for system in $SYSTEMS; do
       ;;
     vllm)
       port=$VLLM_PORT; port_free "$port"
-      /workspace/vllm-env/bin/vllm serve "$MODEL" --port "$port" --max-num-seqs "$MAX_SEQS" \
+      PATH="/workspace/vllm-env/bin:$PATH" vllm serve "$MODEL" --port "$port" --max-num-seqs "$MAX_SEQS" \
         --max-num-batched-tokens "$MAX_TOKENS" --max-model-len 4096 --enable-prefix-caching \
         --kv-cache-memory-bytes "$((KV_GB * 1024 * 1024 * 1024))" &
       ;;
