@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kvserve</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --surface-2: #f0efec;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --accent: #2a78d6;
+  --accent-ink: #1c5cab;
+  --accent-track: #cde2fb;
+  --accent-wash: rgba(42, 120, 214, 0.12);
+  --user-bubble: #2a78d6;
+  --user-ink: #ffffff;
+  --warning: #fab219;
+  --critical: #d03b3b;
+  --good-ink: #006300;
+  --shadow: 0 1px 2px rgba(11, 11, 11, 0.04), 0 4px 16px rgba(11, 11, 11, 0.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --surface-2: #232321;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --accent: #3987e5;
+    --accent-ink: #86b6ef;
+    --accent-track: #184f95;
+    --accent-wash: rgba(57, 135, 229, 0.16);
+    --user-bubble: #256abf;
+    --user-ink: #ffffff;
+    --good-ink: #0ca30c;
+    --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --surface-2: #232321;
+  --ink: #ffffff;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255, 255, 255, 0.10);
+  --accent: #3987e5;
+  --accent-ink: #86b6ef;
+  --accent-track: #184f95;
+  --accent-wash: rgba(57, 135, 229, 0.16);
+  --user-bubble: #256abf;
+  --user-ink: #ffffff;
+  --good-ink: #0ca30c;
+  --shadow: none;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  min-height: 100vh;
+}
+button, input, textarea, select { font: inherit; color: inherit; }
+
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--surface);
+}
+.wordmark { font-weight: 650; font-size: 16px; letter-spacing: -0.01em; }
+.wordmark span { color: var(--accent); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip {
+  font-size: 12px; color: var(--ink-2); background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; white-space: nowrap;
+}
+.status { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.dot.ok { background: #0ca30c; }
+.dot.err { background: var(--critical); }
+.theme-toggle {
+  border: 1px solid var(--border); background: transparent; border-radius: 8px;
+  padding: 2px 8px; cursor: pointer; color: var(--ink-2); font-size: 12px;
+}
+
+main {
+  display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 16px; padding: 16px 20px; max-width: 1400px; margin: 0 auto;
+  height: calc(100vh - 57px);
+}
+@media (max-width: 900px) {
+  main { grid-template-columns: minmax(0, 1fr); height: auto; padding: 12px 16px; }
+  .chat { height: 75vh; }
+}
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: var(--shadow); min-width: 0;
+}
+.card h2 { font-size: 13px; font-weight: 600; margin: 0; color: var(--ink); }
+.card .sub { font-size: 12px; color: var(--muted); }
+
+/* ---- chat ---- */
+.chat { display: flex; flex-direction: column; overflow: hidden; }
+.chat-head { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.chat-head .spacer { flex: 1; }
+.ghost {
+  border: 1px solid var(--border); background: transparent; border-radius: 8px;
+  padding: 4px 10px; cursor: pointer; color: var(--ink-2); font-size: 12px;
+}
+.ghost:hover { background: var(--surface-2); }
+details.system { padding: 0 16px; border-bottom: 1px solid var(--border); }
+details.system summary { cursor: pointer; padding: 8px 0; font-size: 12px; color: var(--ink-2); }
+details.system textarea {
+  width: 100%; min-height: 64px; resize: vertical; margin-bottom: 10px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+}
+.messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+.empty { margin: auto; text-align: center; color: var(--muted); max-width: 380px; }
+.empty b { color: var(--ink-2); font-weight: 600; }
+.suggestions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-top: 12px; }
+.msg { max-width: 85%; }
+.msg.user { align-self: flex-end; }
+.msg.assistant { align-self: flex-start; }
+.bubble { padding: 10px 14px; border-radius: 14px; white-space: pre-wrap; word-wrap: break-word; }
+.user .bubble { background: var(--user-bubble); color: var(--user-ink); border-bottom-right-radius: 4px; }
+.assistant .bubble { background: var(--surface-2); border-bottom-left-radius: 4px; }
+.assistant .bubble.streaming::after {
+  content: ""; display: inline-block; width: 7px; height: 14px; margin-left: 2px;
+  background: var(--accent); vertical-align: -2px; animation: blink 1s steps(2) infinite;
+}
+@keyframes blink { 50% { opacity: 0; } }
+.msg-stats { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; font-size: 12px; color: var(--muted); }
+.msg-stats b { color: var(--ink-2); font-weight: 600; }
+.msg-stats .cached b { color: var(--good-ink); }
+.composer { border-top: 1px solid var(--border); padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
+.composer-row { display: flex; gap: 8px; align-items: flex-end; }
+.composer textarea {
+  flex: 1; resize: none; min-height: 44px; max-height: 160px; padding: 10px 12px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px;
+}
+.composer textarea:focus, details.system textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.primary {
+  border: 0; background: var(--accent); color: #fff; border-radius: 10px;
+  padding: 0 18px; height: 44px; cursor: pointer; font-weight: 600;
+}
+.primary:disabled { opacity: 0.5; cursor: default; }
+.primary.stop { background: var(--ink-2); }
+.controls { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--ink-2); align-items: center; }
+.controls label { display: flex; align-items: center; gap: 6px; }
+.controls input[type=range] { width: 90px; accent-color: var(--accent); }
+.controls input[type=number] {
+  width: 64px; padding: 2px 6px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+}
+
+/* ---- engine panel ---- */
+.panel { display: flex; flex-direction: column; gap: 16px; overflow-y: auto; min-width: 0; }
+.panel .card { padding: 16px; }
+.hero { display: flex; align-items: baseline; gap: 8px; margin: 6px 0 2px; }
+.hero .value { font-size: 48px; font-weight: 650; letter-spacing: -0.02em; line-height: 1; }
+.hero .unit { color: var(--ink-2); font-size: 14px; }
+.chart-wrap { position: relative; margin-top: 10px; }
+.chart-wrap svg { display: block; width: 100%; height: 120px; overflow: visible; }
+.tooltip {
+  position: absolute; pointer-events: none; transform: translate(-50%, -100%);
+  background: var(--ink); color: var(--surface); font-size: 12px; padding: 4px 8px; border-radius: 6px;
+  white-space: nowrap; opacity: 0; transition: opacity 0.1s;
+}
+.tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.tile { background: var(--surface-2); border-radius: 10px; padding: 10px 12px; }
+.tile .label { font-size: 12px; color: var(--ink-2); }
+.tile .val { font-size: 22px; font-weight: 600; margin-top: 2px; }
+.tile .hint { font-size: 11px; color: var(--muted); }
+.meter { margin-top: 12px; }
+.meter-top { display: flex; justify-content: space-between; font-size: 12px; color: var(--ink-2); margin-bottom: 6px; }
+.meter-top b { color: var(--ink); font-weight: 600; }
+.track { height: 10px; border-radius: 999px; background: var(--accent-track); overflow: hidden; }
+.fill { height: 100%; width: 0; border-radius: 999px; background: var(--accent); transition: width 0.3s, background 0.3s; }
+.fill.warn { background: var(--warning); }
+.fill.crit { background: var(--critical); }
+.meter-state { font-size: 11px; color: var(--muted); margin-top: 4px; min-height: 16px; }
+.burst-row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.burst-result { margin-top: 12px; font-size: 12px; color: var(--ink-2); }
+.burst-result .bar { height: 6px; background: var(--accent-track); border-radius: 999px; overflow: hidden; margin: 6px 0 8px; }
+.burst-result .bar div { height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+.burst-result dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0; }
+.burst-result dt { color: var(--muted); }
+.burst-result dd { margin: 0; color: var(--ink); font-weight: 600; }
+details.data summary { cursor: pointer; font-size: 12px; color: var(--muted); margin-top: 10px; }
+details.data table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+details.data th, details.data td { text-align: right; padding: 2px 6px; border-bottom: 1px solid var(--grid); }
+details.data th:first-child, details.data td:first-child { text-align: left; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<header>
+  <div class="wordmark">kv<span>serve</span></div>
+  <div class="chips" id="chips"></div>
+  <div class="status"><span class="dot" id="dot"></span><span id="status-text">connecting</span>
+    <button class="theme-toggle" id="theme" title="Toggle light/dark">theme</button></div>
+</header>
+
+<main>
+  <section class="card chat" aria-label="Chat">
+    <div class="chat-head">
+      <h2>Chat</h2><span class="sub">streams from /v1/chat/completions</span>
+      <span class="spacer"></span>
+      <button class="ghost" id="new-chat">New chat</button>
+    </div>
+    <details class="system">
+      <summary>System prompt (shared across chats, so it is served from the prefix cache)</summary>
+      <textarea id="system">You are a concise, helpful assistant running on kvserve, an LLM inference engine with a paged KV cache, continuous batching and prefix caching. Answer clearly in a few sentences.</textarea>
+    </details>
+    <div class="messages" id="messages">
+      <div class="empty" id="empty">
+        <b>Ask anything.</b> Each reply shows time to first token, decode speed and how
+        many prompt tokens came from the prefix cache. Send a second message to watch the
+        cache hit rate jump: the whole conversation so far is reused.
+        <div class="suggestions">
+          <button class="ghost" data-suggest="Explain what a KV cache is in two sentences.">What is a KV cache?</button>
+          <button class="ghost" data-suggest="Why is LLM decoding memory-bandwidth bound?">Why is decode memory bound?</button>
+          <button class="ghost" data-suggest="Write a haiku about GPUs.">Haiku about GPUs</button>
+        </div>
+      </div>
+    </div>
+    <div class="composer">
+      <div class="composer-row">
+        <textarea id="input" rows="1" placeholder="Message kvserve" title="Enter to send, Shift+Enter for a new line"></textarea>
+        <button class="primary" id="send">Send</button>
+      </div>
+      <div class="controls">
+        <label>temperature <input type="range" id="temp" min="0" max="1.5" step="0.1" value="0.7"><span id="temp-val">0.7</span></label>
+        <label>max tokens <input type="number" id="max-tokens" min="1" max="2048" value="256"></label>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" aria-label="Engine">
+    <div class="card">
+      <h2>Generation throughput</h2>
+      <div class="hero"><span class="value" id="tps">0</span><span class="unit">tokens / s</span></div>
+      <div class="sub">all requests, 3 s window; chart shows the last 60 s</div>
+      <div class="chart-wrap" id="chart-wrap">
+        <svg id="chart" role="img" aria-label="Tokens per second over the last 60 seconds"></svg>
+        <div class="tooltip" id="tooltip"></div>
+      </div>
+      <details class="data">
+        <summary>Show data</summary>
+        <table><thead><tr><th>seconds ago</th><th>tokens/s</th><th>running</th></tr></thead><tbody id="data-rows"></tbody></table>
+      </details>
+    </div>
+
+    <div class="card">
+      <h2>Scheduler</h2>
+      <div class="tiles" style="margin-top:10px">
+        <div class="tile"><div class="label">Running sequences</div><div class="val" id="running">0</div><div class="hint">in the continuous batch</div></div>
+        <div class="tile"><div class="label">Waiting</div><div class="val" id="waiting">0</div><div class="hint">queued for admission</div></div>
+        <div class="tile"><div class="label">Prefix cache hit rate</div><div class="val" id="hit">0%</div><div class="hint">prompt tokens reused</div></div>
+        <div class="tile"><div class="label">Last step</div><div class="val" id="step">-</div><div class="hint" id="step-hint">tokens in one forward pass</div></div>
+      </div>
+      <div class="meter">
+        <div class="meter-top"><span>KV cache in use</span><b id="kv-val">0%</b></div>
+        <div class="track" role="meter" aria-label="KV cache usage" aria-valuemin="0" aria-valuemax="100" id="kv-meter"><div class="fill" id="kv-fill"></div></div>
+        <div class="meter-state" id="kv-state"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Continuous batching demo</h2>
+      <div class="sub">Fire N requests at once and watch them share one batch: running sequences
+        climb, throughput rises, and per-request decode speed stays close to a single request's.</div>
+      <div class="burst-row">
+        <button class="ghost" data-burst="8">Burst 8</button>
+        <button class="ghost" data-burst="32">Burst 32</button>
+        <button class="ghost" data-burst="64">Burst 64</button>
+      </div>
+      <div class="burst-result" id="burst" hidden>
+        <div id="burst-title"></div>
+        <div class="bar"><div id="burst-bar"></div></div>
+        <dl>
+          <dt>Aggregate throughput</dt><dd id="b-agg">-</dd>
+          <dt>Per-request decode</dt><dd id="b-per">-</dd>
+          <dt>Time to first token p50 / max</dt><dd id="b-ttft">-</dd>
+          <dt>Wall time</dt><dd id="b-wall">-</dd>
+        </dl>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => n >= 10000 ? (n / 1000).toFixed(1) + "K" : Math.round(n).toLocaleString();
+const ms = (s) => s < 1 ? Math.round(s * 1000) + " ms" : s.toFixed(2) + " s";
+
+// ---- theme ----
+try { const t = localStorage.getItem("kvserve-theme"); if (t) document.documentElement.dataset.theme = t; } catch {}
+$("theme").onclick = () => {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const cur = document.documentElement.dataset.theme || (dark ? "dark" : "light");
+  const next = cur === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("kvserve-theme", next); } catch {}
+  drawChart();
+};
+
+// ---- SSE streaming over fetch ----
+async function streamChat(messages, params, onToken, signal) {
+  // Start the clock before the request: the server sends headers together with the
+  // first token, so time spent waiting for the response *is* time to first token.
+  const start = performance.now();
+  const res = await fetch("/v1/chat/completions", {
+    method: "POST", headers: { "content-type": "application/json" }, signal,
+    body: JSON.stringify({ messages, stream: true, stream_options: { include_usage: true }, ...params }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", first = null, last = null, usage = null, tokens = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+      if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+      const data = JSON.parse(line.slice(6));
+      if (data.usage) usage = data.usage;
+      const text = data.choices?.[0]?.delta?.content;
+      if (text) {
+        const now = performance.now();
+        if (first === null) first = now;
+        last = now; tokens++;
+        onToken(text);
+      }
+    }
+  }
+  const n = usage ? usage.completion_tokens : tokens;
+  const decodeS = first !== null && last > first ? (last - first) / 1000 : 0;
+  return {
+    ttft: first === null ? null : (first - start) / 1000,
+    tokens: n,
+    tps: decodeS > 0 && n > 1 ? (n - 1) / decodeS : null,
+    prompt: usage?.prompt_tokens ?? 0,
+    cached: usage?.prompt_tokens_details?.cached_tokens ?? 0,
+    wall: (performance.now() - start) / 1000,
+  };
+}
+
+// ---- chat ----
+let history = [], controller = null;
+const input = $("input"), sendBtn = $("send");
+$("temp").oninput = () => { $("temp-val").textContent = $("temp").value; };
+input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = input.scrollHeight + "px"; });
+input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+sendBtn.onclick = () => controller ? controller.abort() : send();
+$("new-chat").onclick = () => { if (controller) controller.abort(); history = []; $("messages").replaceChildren($("empty")); $("empty").hidden = false; };
+document.querySelectorAll("[data-suggest]").forEach((b) => b.onclick = () => { input.value = b.dataset.suggest; send(); });
+
+function addMessage(role, text) {
+  $("empty").hidden = true;
+  const wrap = document.createElement("div"); wrap.className = "msg " + role;
+  const bubble = document.createElement("div"); bubble.className = "bubble"; bubble.textContent = text;
+  wrap.append(bubble); $("messages").append(wrap);
+  $("messages").scrollTop = $("messages").scrollHeight;
+  return { wrap, bubble };
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text || controller) return;
+  input.value = ""; input.style.height = "auto";
+  if (!$("empty").isConnected) $("messages").prepend($("empty"));
+  addMessage("user", text);
+  history.push({ role: "user", content: text });
+  const { wrap, bubble } = addMessage("assistant", "");
+  bubble.classList.add("streaming");
+  controller = new AbortController();
+  sendBtn.textContent = "Stop"; sendBtn.classList.add("stop");
+  const system = $("system").value.trim();
+  const messages = (system ? [{ role: "system", content: system }] : []).concat(history);
+  let reply = "";
+  try {
+    const r = await streamChat(messages,
+      { temperature: +$("temp").value, max_tokens: +$("max-tokens").value },
+      (t) => { reply += t; bubble.textContent = reply; $("messages").scrollTop = $("messages").scrollHeight; },
+      controller.signal);
+    const stats = document.createElement("div"); stats.className = "msg-stats";
+    const pct = r.prompt ? Math.round(100 * r.cached / r.prompt) : 0;
+    stats.innerHTML =
+      `<span>first token <b>${r.ttft === null ? "-" : ms(r.ttft)}</b></span>` +
+      `<span><b>${r.tps === null ? "-" : r.tps.toFixed(1)}</b> tok/s</span>` +
+      `<span><b>${r.tokens}</b> tokens</span>` +
+      `<span class="cached"><b>${r.cached}</b> of ${r.prompt} prompt tokens cached (${pct}%)</span>`;
+    wrap.append(stats);
+  } catch (e) {
+    if (e.name !== "AbortError") reply += (reply ? "\n\n" : "") + "[error: " + e.message + "]";
+    else reply += reply ? " [stopped]" : "[stopped]";
+    bubble.textContent = reply;
+  } finally {
+    bubble.classList.remove("streaming");
+    history.push({ role: "assistant", content: reply });
+    controller = null; sendBtn.textContent = "Send"; sendBtn.classList.remove("stop");
+    input.focus();
+  }
+}
+
+// ---- live stats ----
+const samples = []; // {t, tps, running}
+const WINDOW = 60;
+async function poll() {
+  try {
+    const s = await (await fetch("/stats")).json();
+    $("dot").className = "dot ok"; $("status-text").textContent = "live";
+    if (!$("chips").childElementCount) {
+      const chips = [s.info.model, `${s.info.device} · ${s.info.dtype}`, s.info.attention,
+        s.info.cuda_graphs ? `cuda graphs ≤ ${s.info.cuda_graphs}` : "cuda graphs off",
+        `${fmt(s.info.kv_capacity_tokens)} KV tokens`];
+      $("chips").replaceChildren(...chips.map((c) => Object.assign(document.createElement("span"), { className: "chip", textContent: c })));
+    }
+    $("tps").textContent = fmt(s.tokens_per_s);
+    $("running").textContent = s.running;
+    $("waiting").textContent = s.waiting;
+    $("hit").textContent = Math.round(100 * s.prefix_hit_rate) + "%";
+    $("step").textContent = s.running ? s.last_step_tokens : "-";
+    $("step-hint").textContent = s.running ? `tokens in one forward pass, ${s.last_step_ms.toFixed(1)} ms` : "tokens in one forward pass";
+    const kv = Math.round(100 * s.kv_usage);
+    $("kv-val").textContent = kv + "%";
+    $("kv-fill").style.width = Math.max(kv, s.kv_usage > 0 ? 1 : 0) + "%";
+    $("kv-fill").className = "fill" + (kv >= 95 ? " crit" : kv >= 80 ? " warn" : "");
+    $("kv-meter").setAttribute("aria-valuenow", kv);
+    $("kv-state").textContent = kv >= 95 ? "▲ Critical: near capacity, new requests wait or preempt"
+      : kv >= 80 ? "▲ High usage" : `${fmt(s.info.kv_capacity_tokens * s.kv_usage)} of ${fmt(s.info.kv_capacity_tokens)} token slots`;
+    samples.push({ t: performance.now() / 1000, tps: s.tokens_per_s, running: s.running });
+  } catch {
+    $("dot").className = "dot err"; $("status-text").textContent = "disconnected";
+  }
+  const cutoff = performance.now() / 1000 - WINDOW;
+  while (samples.length && samples[0].t < cutoff) samples.shift();
+  drawChart();
+  renderTable();
+}
+setInterval(poll, 500); poll();
+
+// ---- chart: single series, area + 2px line, crosshair tooltip ----
+const NS = "http://www.w3.org/2000/svg";
+let hoverX = null;
+function el(tag, attrs) { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+function niceMax(v) { if (v <= 10) return 10; const p = 10 ** Math.floor(Math.log10(v)); return Math.ceil(v / p) * p; }
+function drawChart() {
+  const svg = $("chart"), W = svg.clientWidth || 400, H = 120, L = 36, B = 18, T = 6;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.replaceChildren();
+  const css = getComputedStyle(document.documentElement);
+  const now = performance.now() / 1000;
+  const ymax = niceMax(Math.max(...samples.map((s) => s.tps), 1));
+  const x = (t) => L + (W - L) * (1 - (now - t) / WINDOW);
+  const y = (v) => T + (H - B - T) * (1 - v / ymax);
+  for (const f of [0, 0.5, 1]) {
+    const yy = y(ymax * f);
+    svg.append(el("line", { x1: L, x2: W, y1: yy, y2: yy, stroke: f === 0 ? css.getPropertyValue("--axis") : css.getPropertyValue("--grid"), "stroke-width": 1 }));
+    const lab = el("text", { x: L - 6, y: yy + 4, "text-anchor": "end", "font-size": 11, fill: css.getPropertyValue("--muted") });
+    lab.textContent = fmt(ymax * f); svg.append(lab);
+  }
+  for (const ago of [60, 30, 0]) {
+    const lab = el("text", { x: x(now - ago), y: H - 4, "text-anchor": ago === 60 ? "start" : ago === 0 ? "end" : "middle", "font-size": 11, fill: css.getPropertyValue("--muted") });
+    lab.textContent = ago ? `-${ago}s` : "now"; svg.append(lab);
+  }
+  if (samples.length < 2) return;
+  const pts = samples.map((s) => [x(s.t), y(s.tps)]);
+  const line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+  svg.append(el("path", { d: `${line} L ${pts.at(-1)[0]} ${y(0)} L ${pts[0][0]} ${y(0)} Z`, fill: css.getPropertyValue("--accent-wash") }));
+  svg.append(el("path", { d: line, fill: "none", stroke: css.getPropertyValue("--accent"), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+  if (hoverX !== null) {
+    let best = samples[0], bx = Infinity;
+    for (const s of samples) { const d = Math.abs(x(s.t) - hoverX); if (d < bx) { bx = d; best = s; } }
+    const cx = x(best.t), cy = y(best.tps);
+    svg.append(el("line", { x1: cx, x2: cx, y1: T, y2: y(0), stroke: css.getPropertyValue("--axis"), "stroke-width": 1 }));
+    svg.append(el("circle", { cx, cy, r: 4, fill: css.getPropertyValue("--accent"), stroke: css.getPropertyValue("--surface"), "stroke-width": 2 }));
+    const tip = $("tooltip");
+    tip.textContent = `${fmt(best.tps)} tok/s · ${best.running} running · ${Math.round(now - best.t)}s ago`;
+    tip.style.left = Math.min(Math.max(cx, 90), W - 90) + "px"; tip.style.top = (cy - 8) + "px"; tip.style.opacity = 1;
+  }
+}
+$("chart-wrap").addEventListener("pointermove", (e) => { hoverX = e.clientX - $("chart").getBoundingClientRect().left; drawChart(); });
+$("chart-wrap").addEventListener("pointerleave", () => { hoverX = null; $("tooltip").style.opacity = 0; drawChart(); });
+addEventListener("resize", drawChart);
+function renderTable() {
+  const now = performance.now() / 1000;
+  const rows = samples.filter((_, i) => (samples.length - 1 - i) % 10 === 0).slice(-12).reverse();
+  $("data-rows").replaceChildren(...rows.map((s) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${Math.round(now - s.t)}</td><td>${fmt(s.tps)}</td><td>${s.running}</td>`;
+    return tr;
+  }));
+}
+
+// ---- burst demo ----
+const TOPICS = ["GPUs", "the ocean", "compilers", "black holes", "coffee", "chess", "rivers", "databases",
+  "volcanoes", "jazz", "bridges", "bees", "satellites", "deserts", "origami", "lighthouses"];
+let bursting = false;
+document.querySelectorAll("[data-burst]").forEach((b) => b.onclick = () => burst(+b.dataset.burst));
+async function burst(n) {
+  if (bursting) return;
+  bursting = true;
+  document.querySelectorAll("[data-burst]").forEach((b) => b.disabled = true);
+  $("burst").hidden = false;
+  $("burst-title").textContent = `${n} concurrent requests, 128 tokens each`;
+  for (const id of ["b-agg", "b-per", "b-ttft", "b-wall"]) $(id).textContent = "…";
+  let done = 0;
+  $("burst-bar").style.width = "0%";
+  const start = performance.now();
+  const runs = Array.from({ length: n }, (_, i) =>
+    streamChat([{ role: "user", content: `Write a short paragraph about ${TOPICS[i % TOPICS.length]} (variation ${i}).` }],
+      { temperature: 0.8, max_tokens: 128, ignore_eos: true }, () => {})
+      .catch(() => null)
+      .finally(() => { done++; $("burst-bar").style.width = (100 * done / n) + "%"; }));
+  const results = (await Promise.all(runs)).filter(Boolean);
+  const wall = (performance.now() - start) / 1000;
+  const tokens = results.reduce((a, r) => a + r.tokens, 0);
+  const ttfts = results.map((r) => r.ttft).filter((v) => v !== null).sort((a, b) => a - b);
+  const per = results.map((r) => r.tps).filter(Boolean);
+  $("b-agg").textContent = `${fmt(tokens / wall)} tok/s`;
+  $("b-per").textContent = per.length ? `${(per.reduce((a, b) => a + b, 0) / per.length).toFixed(1)} tok/s (mean)` : "-";
+  $("b-ttft").textContent = ttfts.length ? `${ms(ttfts[Math.floor(ttfts.length / 2)])} / ${ms(ttfts.at(-1))}` : "-";
+  $("b-wall").textContent = `${wall.toFixed(1)} s for ${results.length}/${n} requests`;
+  document.querySelectorAll("[data-burst]").forEach((b) => b.disabled = false);
+  bursting = false;
+}
+</script>
+</body>
+</html>
