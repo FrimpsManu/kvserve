@@ -46,6 +46,21 @@ prefill, preemption and prefix caching.
 | Engine on its own thread, commands via queue | GPU work never blocks the event loop; engine state is single-threaded |
 | Fused QKV and gate/up projections | Fewer, larger GEMMs: better hardware utilisation |
 
+## Demo
+
+`uv run kvserve serve`, then open **http://localhost:8000**: a chat UI plus a live view of
+the engine.
+
+![kvserve demo dashboard: chat on the left, live throughput, scheduler and KV cache panels on the right](docs/demo.png)
+
+- **Per-reply stats:** time to first token, decode tok/s, and how many prompt tokens
+  came from the prefix cache. The second turn of a conversation typically reuses most of
+  the prompt (e.g. 48 of 77 prompt tokens on the second turn).
+- **Live engine panel** (polls `/stats`): throughput over the last 60 s, running and
+  waiting sequences, tokens in the last forward pass, KV cache usage, prefix-cache hit rate.
+- **Continuous batching demo:** fire 8/32/64 concurrent requests and watch them share one
+  batch; reports aggregate throughput, per-request decode speed and TTFT.
+
 ## Quickstart
 
 ```bash

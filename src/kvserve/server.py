@@ -7,10 +7,11 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from importlib import resources
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
@@ -107,6 +108,27 @@ def create_app(config: EngineConfig, url: str | None = None) -> FastAPI:
     def engine() -> AsyncLLMEngine:
         return state["engine"]
 
+    demo_page = resources.files("kvserve").joinpath("static/index.html").read_text()
+
+    @app.get("/", include_in_schema=False)
+    async def index() -> HTMLResponse:
+        return HTMLResponse(demo_page)
+
+    @app.get("/stats")
+    async def stats() -> dict:
+        """Live engine counters for the demo dashboard."""
+        eng = engine()
+        runner = eng.engine.runner
+        info = {
+            "model": eng.config.model,
+            "device": eng.config.device,
+            "dtype": str(runner.dtype).removeprefix("torch."),
+            "attention": runner.attn_backend.__name__,
+            "cuda_graphs": runner.graphs.max_batch if runner.graphs else None,
+            "kv_capacity_tokens": runner.num_kv_blocks * eng.config.block_size,
+        }
+        return eng.stats.snapshot() | {"info": info}
+
     @app.get("/health")
     async def health() -> Response:
         ok = engine().healthy
@@ -173,29 +195,37 @@ def create_app(config: EngineConfig, url: str | None = None) -> FastAPI:
 
             async def sse() -> AsyncIterator[str]:
                 last = None
-                async for out in outputs():
-                    if await raw.is_disconnected():
-                        await stream.aclose()  # aborts the request in the engine
-                        return
-                    last = out
-                    text = detok.delta(out.output_token_ids, out.finished)
-                    if chat and len(out.output_token_ids) == 1:
-                        role = chunk("", out)
-                        role["choices"][0]["delta"] = {"role": "assistant", "content": ""}
-                        role["choices"][0]["finish_reason"] = None
-                        yield f"data: {json.dumps(role)}\n\n"
-                    if text or out.finished:
-                        yield f"data: {json.dumps(chunk(text, out))}\n\n"
-                if last is not None and req.include_usage:
-                    body = chunk("", last) | {"choices": [], "usage": usage(last)}
-                    yield f"data: {json.dumps(body)}\n\n"
-                yield "data: [DONE]\n\n"
+                try:
+                    async for out in outputs():
+                        if await raw.is_disconnected():
+                            return
+                        last = out
+                        text = detok.delta(out.output_token_ids, out.finished)
+                        if chat and len(out.output_token_ids) == 1:
+                            role = chunk("", out)
+                            role["choices"][0]["delta"] = {"role": "assistant", "content": ""}
+                            role["choices"][0]["finish_reason"] = None
+                            yield f"data: {json.dumps(role)}\n\n"
+                        if text or out.finished:
+                            yield f"data: {json.dumps(chunk(text, out))}\n\n"
+                    if last is not None and req.include_usage:
+                        body = chunk("", last) | {"choices": [], "usage": usage(last)}
+                        yield f"data: {json.dumps(body)}\n\n"
+                    yield "data: [DONE]\n\n"
+                finally:
+                    # On disconnect Starlette cancels this generator; close the engine stream
+                    # now (aborting the request and freeing its KV blocks) rather than
+                    # whenever the garbage collector gets to it.
+                    await stream.aclose()
 
             return StreamingResponse(sse(), media_type="text/event-stream")
 
         last = None
-        async for out in outputs():
-            last = out
+        try:
+            async for out in outputs():
+                last = out
+        finally:
+            await stream.aclose()  # client may have disconnected mid-generation
         assert last is not None
         text = engine().tokenizer.decode(last.output_token_ids, skip_special_tokens=True)
         body = chunk(text, last)
