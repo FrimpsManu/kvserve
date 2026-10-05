@@ -104,6 +104,7 @@ async def run(args: argparse.Namespace) -> dict:
 
         # Warm up so model compilation / caches do not pollute the measurement.
         await send(client, url, model, prompts[0][0][:16], 4)
+        paths_before = await step_paths(client, base)
 
         tasks = []
         start = time.perf_counter()
@@ -113,7 +114,20 @@ async def run(args: argparse.Namespace) -> dict:
                 await asyncio.sleep(rng.exponential(1.0 / args.request_rate))
         results = await asyncio.gather(*tasks)
         duration = time.perf_counter() - start
-    return summarize(args, model, results, duration)
+        paths_after = await step_paths(client, base)
+    summary = summarize(args, model, results, duration)
+    if paths_before is not None and paths_after is not None:
+        summary["step_paths"] = {k: v - paths_before.get(k, 0) for k, v in paths_after.items()}
+    return summary
+
+
+async def step_paths(client: httpx.AsyncClient, base: str) -> dict[str, int] | None:
+    """kvserve's per-execution-path step counters (None for servers without /stats)."""
+    try:
+        r = await client.get(f"{base}/stats")
+        return r.json().get("step_paths") if r.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return None
 
 
 def _pct(values: list[float], *ps: int) -> dict[str, float]:
@@ -169,6 +183,9 @@ def report(s: dict) -> None:
         st = s[key]
         if st:
             print(f"{key:<8} mean {st['mean']:9.1f}  p50 {st['p50']:9.1f}  p90 {st['p90']:9.1f}  p99 {st['p99']:9.1f}")
+    if s.get("step_paths"):
+        total = sum(s["step_paths"].values()) or 1
+        print("steps    " + "  ".join(f"{k} {v} ({100 * v / total:.0f}%)" for k, v in sorted(s["step_paths"].items())))
 
 
 def main() -> None:
