@@ -2,6 +2,7 @@
 # Like-for-like serving benchmark: kvserve vs. vLLM, same GPU, model, scheduler limits and prompts.
 #   bash bench/compare_vllm.sh                       (run on the GPU pod after scripts/pod_setup.sh --vllm)
 #   SYSTEMS=vllm OUT=results/x.jsonl bash bench/compare_vllm.sh   (one system, append to existing results)
+#   SYSTEMS="kvserve kvserve-decode-graphs kvserve-eager vllm"     (CUDA-graph ablation)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export HF_HOME=${HF_HOME:-/workspace/hf}
@@ -47,10 +48,15 @@ trap '[[ -n "$PID" ]] && kill $PID 2>/dev/null || true' EXIT
 for system in $SYSTEMS; do
   echo "== $system =="
   case $system in
-    kvserve)
+    kvserve|kvserve-decode-graphs|kvserve-eager)
+      # Ablations: full (decode + piecewise graphs), decode graphs only, no graphs.
+      extra=()
+      [[ $system == kvserve-decode-graphs ]] && extra=(--no-enable-piecewise-graphs)
+      [[ $system == kvserve-eager ]] && extra=(--no-enable-cuda-graphs)
       port=$KVSERVE_PORT; port_free "$port"
       uv run kvserve serve --port "$port" --model "$MODEL" --attention-backend triton \
-        --kv-cache-memory-gb "$KV_GB" --max-num-seqs "$MAX_SEQS" --max-num-batched-tokens "$MAX_TOKENS" &
+        --kv-cache-memory-gb "$KV_GB" --max-num-seqs "$MAX_SEQS" --max-num-batched-tokens "$MAX_TOKENS" \
+        "${extra[@]}" &
       ;;
     vllm)
       port=$VLLM_PORT; port_free "$port"
