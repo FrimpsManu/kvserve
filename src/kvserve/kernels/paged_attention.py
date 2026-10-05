@@ -124,8 +124,9 @@ def paged_attention(
     query_start_loc: torch.Tensor,
     max_query_len: int,
     scale: float,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """q: [T, H, D]; caches: [num_blocks, block_size, H_kv, D]. Returns [T, H, D]."""
+    """q: [T, H, D]; caches: [num_blocks, block_size, H_kv, D]. Returns [T, H, D] (in `out` if given)."""
     num_tokens, num_heads, head_dim = q.shape
     _, block_size, num_kv_heads, _ = k_cache.shape
     assert num_heads % num_kv_heads == 0
@@ -138,7 +139,9 @@ def paged_attention(
     min_q = max(1, 16 // group)
     block_q = min_q if max_query_len <= min_q else max(min_q, 64 // group)
 
-    out = torch.empty_like(q)
+    if out is None:
+        out = torch.empty_like(q)
+    assert out.shape == q.shape and out.stride(-1) == 1
     grid = (num_seqs, num_kv_heads, triton.cdiv(max_query_len, block_q))
     _paged_attention_kernel[grid](
         q, k_cache, v_cache, out, block_tables, seq_lens, query_start_loc, scale,

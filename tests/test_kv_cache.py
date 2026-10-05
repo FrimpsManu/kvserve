@@ -54,6 +54,15 @@ def test_slot_mapping():
     assert [kv.slot(seq, p) for p in range(6)] == [b0 * 4, b0 * 4 + 1, b0 * 4 + 2, b0 * 4 + 3, b1 * 4, b1 * 4 + 1]
 
 
+@pytest.mark.parametrize(("start", "n"), [(0, 1), (0, 4), (3, 1), (3, 6), (2, 13), (8, 4), (5, 0)])
+def test_slots_matches_per_token_slot(start, n):
+    kv = KVCacheManager(num_blocks=16, block_size=4)
+    seq = make_seq(list(range(20)))
+    kv.allocate_slots(seq, 20)
+    seq.block_table.reverse()  # non-contiguous, non-monotonic pages
+    assert kv.slots(seq, start, n) == [kv.slot(seq, p) for p in range(start, start + n)]
+
+
 def test_prefix_cache_hit_shares_blocks():
     kv = KVCacheManager(num_blocks=16, block_size=4)
     a = make_seq(list(range(10)), "a")

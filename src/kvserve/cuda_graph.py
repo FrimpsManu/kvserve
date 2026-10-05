@@ -60,7 +60,6 @@ class DecodeGraphRunner:
         # Every sequence contributes exactly one query token, so these never change.
         self.query_lens = torch.ones(b, dtype=torch.long, device=dev)
         self.query_start_loc = torch.arange(b + 1, dtype=torch.long, device=dev)
-        self._unused = torch.zeros(b, 1, dtype=torch.long, device=dev)  # torch-backend-only fields
 
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.outputs: dict[int, torch.Tensor] = {}
@@ -71,8 +70,6 @@ class DecodeGraphRunner:
             block_tables=self.block_tables[:n],
             seq_lens=self.seq_lens[:n],
             query_lens=self.query_lens[:n],
-            q_gather=self._unused[:n],
-            q_valid=self._unused[:n].bool(),
             query_start_loc=self.query_start_loc[: n + 1],
             max_seq_len=1,  # unused by the Triton backend
             max_query_len=1,
@@ -138,3 +135,107 @@ class DecodeGraphRunner:
 
         self.graphs[size].replay()
         return self.outputs[size][:n]
+
+
+def piecewise_sizes(max_tokens: int) -> list[int]:
+    """Token-count buckets: fine-grained where decode-heavy mixed steps land, coarser for
+    large prefill steps (padding a 1100-token step to 1280 costs <= ~16% extra GEMM work)."""
+    sizes = [1, 2, 4, 8]
+    sizes += list(range(16, 257, 16))
+    sizes += list(range(320, 1025, 64))
+    sizes += list(range(1280, max_tokens + 1, 256))
+    sizes = [s for s in sizes if s <= max_tokens]
+    if sizes[-1] != max_tokens:
+        sizes.append(max_tokens)
+    return sizes
+
+
+class PiecewiseGraphRunner:
+    """CUDA graphs around everything except attention, for any step shape.
+
+    Decode-only graphs (DecodeGraphRunner) cannot serve steps that mix prefill chunks and
+    decodes: attention's launch grid and metadata depend on how tokens split into
+    sequences. Everything else in the model is row-wise over the flat token batch, so it
+    depends only on the token count. The forward pass is split at the attention calls
+    into num_layers + 1 pieces (LlamaForCausalLM.piece); each piece is captured once per
+    token-count bucket, and attention runs eagerly in between on the real (unpadded)
+    tokens with the step's own metadata.
+
+    Pieces never read or write the KV cache, so padding rows are harmless and capture
+    warm-up needs no scratch space. A step costs num_layers + 1 graph replays plus
+    num_layers attention launches instead of ~300 individual kernel launches.
+    """
+
+    def __init__(self, model: LlamaForCausalLM, max_tokens: int):
+        self.model = model
+        self.sizes = piecewise_sizes(max_tokens)
+        self.max_tokens = self.sizes[-1]
+        cfg = model.cfg
+        p = next(model.parameters())
+        dev, dtype = p.device, p.dtype
+        t = self.max_tokens
+        self.input_ids = torch.zeros(t, dtype=torch.long, device=dev)
+        self.positions = torch.zeros(t, dtype=torch.long, device=dev)
+        self.x = torch.zeros(t, cfg.hidden_size, dtype=dtype, device=dev)
+        self.q = torch.zeros(t, cfg.num_heads, cfg.head_dim, dtype=dtype, device=dev)
+        self.k = torch.zeros(t, cfg.num_kv_heads, cfg.head_dim, dtype=dtype, device=dev)
+        self.v = torch.zeros(t, cfg.num_kv_heads, cfg.head_dim, dtype=dtype, device=dev)
+        self.attn = torch.zeros(t, cfg.num_heads, cfg.head_dim, dtype=dtype, device=dev)
+        self.hidden = torch.zeros(t, cfg.hidden_size, dtype=dtype, device=dev)
+        self.num_pieces = cfg.num_layers + 1
+        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+
+    def _run_piece(self, i: int, n: int) -> None:
+        """Piece i on the first n rows of the static buffers, writing results back into them."""
+        x, q, k, v = self.model.piece(i, self.input_ids[:n], self.positions[:n], self.x[:n], self.attn[:n])
+        if q is None:
+            self.hidden[:n].copy_(x)
+            return
+        self.x[:n].copy_(x)
+        self.q[:n].copy_(q)
+        self.k[:n].copy_(k)
+        self.v[:n].copy_(v)
+
+    @torch.inference_mode()
+    def capture(self) -> None:
+        pool = None
+        stream = torch.cuda.Stream()
+        for n in reversed(self.sizes):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    for i in range(self.num_pieces):
+                        self._run_piece(i, n)
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            for i in range(self.num_pieces):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=pool):
+                    self._run_piece(i, n)
+                pool = graph.pool()
+                self.graphs[(i, n)] = graph
+        torch.cuda.synchronize()
+
+    def bucket(self, n: int) -> int | None:
+        for size in self.sizes:
+            if size >= n:
+                return size
+        return None
+
+    @torch.inference_mode()
+    def run(
+        self, input_ids: list[int], positions: list[int], kv_caches: torch.Tensor, meta: AttentionMetadata
+    ) -> torch.Tensor:
+        n = len(input_ids)
+        size = self.bucket(n)
+        assert size is not None, f"{n} tokens exceed largest piecewise bucket {self.max_tokens}"
+        # Rows n..size keep stale but valid ids/positions from earlier steps; their
+        # results are discarded and they never reach attention or the KV cache.
+        self.input_ids[:n].copy_(torch.tensor(input_ids), non_blocking=True)
+        self.positions[:n].copy_(torch.tensor(positions), non_blocking=True)
+        layers = self.model.layers
+        for i in range(self.num_pieces):
+            self.graphs[(i, size)].replay()
+            if i < len(layers):
+                layers[i].self_attn.attend(self.q[:n], self.k[:n], self.v[:n], kv_caches[i], meta, out=self.attn[:n])
+        return self.hidden[:n]

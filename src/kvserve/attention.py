@@ -20,11 +20,12 @@ class AttentionMetadata:
     block_tables: torch.Tensor  # [B, max_blocks] physical block ids, 0-padded
     seq_lens: torch.Tensor  # [B] context length including this step's tokens
     query_lens: torch.Tensor  # [B] tokens computed this step
-    q_gather: torch.Tensor  # [B, max_q] flat index of each query token, 0-padded
-    q_valid: torch.Tensor  # [B, max_q] bool, False on padding
     query_start_loc: torch.Tensor  # [B + 1] offset of each sequence's first token in the flat batch
     max_seq_len: int
     max_query_len: int
+    # Padded layout, needed only by the torch reference backend.
+    q_gather: torch.Tensor | None = None  # [B, max_q] flat index of each query token, 0-padded
+    q_valid: torch.Tensor | None = None  # [B, max_q] bool, False on padding
 
 
 class TorchAttention:
@@ -45,8 +46,14 @@ class TorchAttention:
 
     @staticmethod
     def forward(
-        q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, meta: AttentionMetadata, scale: float
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        meta: AttentionMetadata,
+        scale: float,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        assert meta.q_gather is not None and meta.q_valid is not None, "torch backend needs padded-layout metadata"
         num_tokens, num_heads, head_dim = q.shape
         block_size, num_kv_heads = k_cache.shape[1], k_cache.shape[2]
         num_seqs = meta.block_tables.shape[0]
@@ -69,10 +76,10 @@ class TorchAttention:
         k_pos = torch.arange(meta.max_seq_len, device=device)
         mask = k_pos[None, None, :] <= q_pos[:, :, None]  # [B, max_q, S]
 
-        out = F.scaled_dot_product_attention(qp, k, v, attn_mask=mask[:, None], scale=scale)
-        out = out.transpose(1, 2)[meta.q_valid]  # [T, H, D] in flat token order
-        assert out.shape[0] == num_tokens and num_seqs == meta.q_valid.shape[0]
-        return out
+        res = F.scaled_dot_product_attention(qp, k, v, attn_mask=mask[:, None], scale=scale)
+        res = res.transpose(1, 2)[meta.q_valid]  # [T, H, D] in flat token order
+        assert res.shape[0] == num_tokens and num_seqs == meta.q_valid.shape[0]
+        return out.copy_(res) if out is not None else res
 
 
 class TritonAttention(TorchAttention):
@@ -80,13 +87,19 @@ class TritonAttention(TorchAttention):
 
     @staticmethod
     def forward(
-        q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, meta: AttentionMetadata, scale: float
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        meta: AttentionMetadata,
+        scale: float,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from kvserve.kernels.paged_attention import paged_attention
 
         return paged_attention(
-            q, k_cache, v_cache, meta.block_tables, meta.seq_lens, meta.query_start_loc, meta.max_query_len, scale
-        )
+            q, k_cache, v_cache, meta.block_tables, meta.seq_lens, meta.query_start_loc, meta.max_query_len, scale,
+            out=out,
+        )  # fmt: skip
 
 
 def triton_available() -> bool:

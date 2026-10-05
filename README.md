@@ -84,7 +84,8 @@ print(engine.generate(["The capital of France is"], SamplingParams(temperature=0
 
 Engine flags (`uv run kvserve serve --help`): `--block-size`, `--kv-cache-memory-gb`,
 `--max-num-seqs`, `--max-num-batched-tokens`, `--max-model-len`,
-`--no-enable-prefix-caching`, `--attention-backend auto|torch|triton`, `--device`, `--dtype`.
+`--no-enable-prefix-caching`, `--attention-backend auto|torch|triton`, `--no-enable-cuda-graphs`,
+`--no-enable-piecewise-graphs`, `--max-piecewise-tokens`, `--device`, `--dtype`.
 
 ## Benchmarks
 
@@ -135,49 +136,79 @@ padded batch size (`bench/bench_decode.py`, 512-token contexts):
 The remaining growth with batch size is per-step Python input preparation, which
 scales with the number of sequences.
 
-### Serving: kvserve vs. vLLM 0.30
+### Piecewise CUDA graphs for mixed steps
 
-`bench/compare_vllm.sh`: all systems on the same pod (RTX 4090, EPYC 7532), same model,
+Decode graphs only cover steps where every sequence decodes one token. Under load most
+steps mix prefill chunks with decodes, so they still paid full launch overhead. The
+forward pass is split at the attention calls into `num_layers + 1` pieces; each piece is
+captured per token-count bucket and attention runs eagerly in between with the step's
+own metadata. Pieces never touch the KV cache, so padding is harmless.
+
+Single-step time, one sequence prefilling (RTX 4090):
+
+| Tokens in step | Eager | Piecewise | |
+|---|---|---|---|
+| 17 | 11.6 ms | **3.6 ms** | 3.2x |
+| 257 | 11.4 ms | **6.4 ms** | 1.8x |
+| 513 | 11.7 ms | 10.1 ms | 1.2x |
+| 1025 | 18.4 ms | 20.5 ms | 0.9x (padded to 1280) |
+| 2048 | 33.9 ms | 33.9 ms | 1.0x |
+
+Past ~512 tokens a step is compute bound, so piecewise graphs cover steps up to
+`--max-piecewise-tokens` (default 512) and larger steps run eagerly. Capture: 408
+graphs, about 1 s at startup.
+
+### Serving: kvserve vs. vLLM 0.31
+
+`bench/compare_vllm.sh`: all systems on one pod (RTX 4090, EPYC 7642), same model,
 `max_num_seqs=128`, `max_num_batched_tokens=2048`, 8 GB KV cache, prefix caching on,
 256 requests per scenario, fixed token-id prompts with `ignore_eos`. Goodput counts
-requests meeting TTFT <= 1 s and TPOT <= 100 ms. "eager" is kvserve with
-`--no-enable-cuda-graphs`.
+requests meeting TTFT <= 1 s and TPOT <= 100 ms. Ablation: **kvserve** (decode +
+piecewise graphs), **decode graphs** (`--no-enable-piecewise-graphs`), **eager**
+(`--no-enable-cuda-graphs`).
 
 | Scenario (in/out tokens) | System | Output tok/s | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) | Goodput (req/s) |
 |---|---|---|---|---|---|
-| 512/128, 4 req/s | kvserve | 452 | 22 / 38 | **5.6** / 7.5 | 3.53 |
-| | kvserve eager | 446 | 32 / 115 | 13.9 / 16.0 | 3.49 |
-| | vLLM | 453 | 22 / 40 | 3.4 / 3.7 | 3.54 |
-| 512/128, 8 req/s | kvserve | 893 | 22 / 40 | **6.2** / 9.3 | 6.98 |
-| | kvserve eager | 866 | 35 / 58 | 15.6 / 19.4 | 6.77 |
-| | vLLM | 901 | 19 / 26 | 3.4 / 3.7 | 7.04 |
-| 512/128, 16 req/s | kvserve | 1696 | 54 / 117 | 16.4 / 22.9 | 13.25 |
-| | kvserve eager | 1479 | 80 / 180 | 36.3 / 47.3 | 11.56 |
-| | vLLM | 1771 | 21 / 35 | 3.6 / 3.9 | 13.84 |
-| 512/128, 32 req/s | kvserve | 2149 | 507 / 3138 | 38.6 / 46.3 | 9.25 |
-| | kvserve eager | 1638 | 1564 / 5757 | 51.0 / 55.4 | 5.80 |
-| | vLLM | 3413 | 23 / 52 | 3.9 / 4.2 | 26.67 |
-| 512/128, burst | kvserve | 2340 | 5595 / 11458 | 38.4 / 41.6 | 3.79 |
-| | kvserve eager | 1822 | 7241 / 14673 | 50.3 / 54.1 | 2.89 |
-| | vLLM | 6684 | 2412 / 4192 | 9.4 / 13.0 | 20.40 |
-| 1024/128, 768 shared prefix, 16 req/s | kvserve | 1651 | 68 / 127 | 21.3 / 29.6 | 12.90 |
-| | kvserve eager | 1447 | 92 / 245 | 42.7 / 54.2 | 11.30 |
-| | vLLM | 1762 | 26 / 44 | 3.9 / 4.3 | 13.77 |
+| 512/128, 4 req/s | kvserve | 452 | 20 / 35 | 5.5 / 6.7 | 3.53 |
+| | decode graphs | 452 | 21 / 37 | 5.3 / 6.4 | 3.53 |
+| | eager | 446 | 30 / 53 | 13.9 / 15.9 | 3.49 |
+| | vLLM | 453 | 24 / 39 | 3.5 / 3.7 | 3.54 |
+| 512/128, 8 req/s | kvserve | 895 | 13 / 61 | 5.6 / 7.9 | 6.99 |
+| | decode graphs | 893 | 24 / 43 | 6.6 / 9.4 | 6.98 |
+| | eager | 866 | 36 / 85 | 15.5 / 25.0 | 6.77 |
+| | vLLM | 901 | 14 / 22 | 3.4 / 3.6 | 7.04 |
+| 512/128, 16 req/s | kvserve | 1730 | 22 / 42 | **8.4** / 12.1 | 13.52 |
+| | decode graphs | 1721 | 46 / 90 | 12.1 / 17.5 | 13.45 |
+| | eager | 1625 | 45 / 105 | 18.2 / 29.9 | 12.70 |
+| | vLLM | 1770 | 20 / 33 | 3.6 / 4.0 | 13.83 |
+| 512/128, 32 req/s | kvserve | 2634 | 70 / **523** | 27.0 / 31.7 | **20.58** |
+| | decode graphs | 2309 | 427 / 2910 | 37.1 / 43.8 | 9.72 |
+| | eager | 2072 | 91 / 1900 | 37.7 / 45.8 | 12.78 |
+| | vLLM | 3400 | 25 / 49 | 4.0 / 4.4 | 26.57 |
+| 1024/128, 768 shared prefix, 16 req/s | kvserve | 1725 | 31 / 77 | **10.5** / 16.0 | 13.48 |
+| | decode graphs | 1716 | 49 / 140 | 14.9 / 20.9 | 13.40 |
+| | eager | 1490 | 84 / 167 | 38.1 / 45.5 | 11.64 |
+| | vLLM | 1760 | 29 / 56 | 4.1 / 4.6 | 13.75 |
 
-**Where kvserve stands:** at 4-16 req/s it delivers 96-100% of vLLM's goodput with
-TTFT on par at low load; CUDA graphs cut TPOT 2.2-2.5x there. At saturation it reaches
-35% of vLLM's peak throughput.
+**Where kvserve stands:** 98-100% of vLLM's goodput at 4-16 req/s and **77% at 32 req/s**
+(up from 37% with decode graphs alone), with p99 TTFT at 32 req/s down from 2.9 s to
+0.5 s.
 
-**Why the gap remains at high load (measured):** under heavy arrival, most steps mix
-prefill chunks with decodes. Those steps cannot use the decode graphs and run eagerly,
-so TPOT at 32 req/s (38.6 ms) sits near the eager step time. Next: piecewise graphs
-(capture everything except attention, which works for mixed batches) and vectorised
-input preparation.
+**Burst (all 256 requests at once) is a serving-layer problem, not an engine one.**
+Offline, the engine finishes the same burst at 6,730-6,980 tok/s, on par with vLLM's
+served ~6,700. Over HTTP it reaches 2,500-3,600 tok/s, varying by up to ~35% across
+server restarts (run-to-run variance within one server instance is ~2%; raw data in
+[`burst_variance.jsonl`](results/rtx4090/burst_variance.jsonl)). Engine metrics during an
+HTTP burst show why: the engine is busy 98% of the time but needs 60% more steps (466 vs
+290: requests trickle in through the HTTP layer, so batches are smaller) and each step is
+15% slower. The API server and the engine share one Python process and its GIL, so
+per-token streaming work (detokenisation, JSON events for 256 streams) competes with the
+engine thread. vLLM runs the engine in a separate process for this reason; that is the
+next milestone.
 
-**Host matters for a launch-bound engine:** eager kvserve reached 2656 tok/s on an EPYC
-75F3 host and 1822 tok/s here with the same GPU model, so every comparison above is
-from a single host. Earlier single-host results (EPYC 75F3, before CUDA graphs) are in
-[`results/rtx4090/serving_kvserve_vs_vllm.jsonl`](results/rtx4090/serving_kvserve_vs_vllm.jsonl).
+Earlier results on other hosts are kept in [`results/rtx4090/`](results/rtx4090): decode
+graphs vs eager vs vLLM 0.30 (EPYC 7532) and the pre-graphs baseline (EPYC 75F3). For a
+launch-bound engine the host CPU changes results, so only same-host numbers are compared.
 
 ### Apple M5 Pro (MPS), development baseline
 
@@ -229,7 +260,8 @@ that the allocator never leaks or double-frees blocks.
 - [x] Triton paged-attention kernel (mixed prefill/decode, GQA-aware), 89% of HBM peak
 - [x] NVIDIA benchmarks vs. vLLM, with per-step profiling of the gap
 - [x] CUDA Graphs for decode: 3.95 ms/step at batch 1 (3.0x), 96-100% of vLLM goodput at moderate load
-- [ ] Piecewise CUDA graphs for mixed prefill/decode steps; vectorised input preparation
+- [x] Piecewise CUDA graphs for mixed prefill/decode steps: 77% of vLLM goodput at 32 req/s (from 37%)
+- [ ] Engine in its own process (API server and engine no longer share a GIL); O(1) incremental detokenisation
 - [ ] Split-KV decode for small batches / long contexts
 - [ ] Tensor parallelism (NCCL)
 - [ ] Go gateway, KV-cache-aware router, disaggregated prefill/decode

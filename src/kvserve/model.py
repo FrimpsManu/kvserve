@@ -81,24 +81,31 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(self.q_size, cfg.hidden_size, bias=False)
         self.scale = self.head_dim**-0.5
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        rope: RotaryEmbedding,
-        kv_cache: torch.Tensor,
-        meta: AttentionMetadata,
-    ) -> torch.Tensor:
+    def project(
+        self, x: torch.Tensor, positions: torch.Tensor, rope: RotaryEmbedding
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """QKV projection + RoPE: [T, hidden] -> q [T, H, D], k and v [T, H_kv, D]."""
         n = x.shape[0]
         q, k, v = self.qkv_proj(x).split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(n, self.num_heads, self.head_dim)
         k = k.view(n, self.num_kv_heads, self.head_dim)
         v = v.view(n, self.num_kv_heads, self.head_dim)
         q, k = rope(q, k, positions)
+        return q, k, v
+
+    def attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: torch.Tensor,
+        meta: AttentionMetadata,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Write this step's K/V into the paged cache and attend over it: [T, H, D]."""
         k_cache, v_cache = kv_cache[0], kv_cache[1]
         self.backend.write_kv(k_cache, v_cache, k, v, meta.slot_mapping)
-        out = self.backend.forward(q, k_cache, v_cache, meta, self.scale)
-        return self.o_proj(out.reshape(n, self.q_size))
+        return self.backend.forward(q, k_cache, v_cache, meta, self.scale, out=out)
 
 
 class MLP(nn.Module):
@@ -120,10 +127,6 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = MLP(cfg)
 
-    def forward(self, x, positions, rope, kv_cache, meta):  # type: ignore[no-untyped-def]
-        x = x + self.self_attn(self.input_layernorm(x), positions, rope, kv_cache, meta)
-        return x + self.mlp(self.post_attention_layernorm(x))
-
 
 class LlamaForCausalLM(nn.Module):
     def __init__(self, cfg: ModelConfig, max_positions: int, backend: type[TorchAttention] = TorchAttention):
@@ -142,10 +145,41 @@ class LlamaForCausalLM(nn.Module):
         self, input_ids: torch.Tensor, positions: torch.Tensor, kv_caches: torch.Tensor, meta: AttentionMetadata
     ) -> torch.Tensor:
         """Returns final hidden states [T, hidden]. kv_caches: [layers, 2, blocks, bs, kv_heads, D]."""
-        x = self.embed_tokens(input_ids)
+        x, q, k, v = self.piece(0, input_ids, positions, None, None)
         for i, layer in enumerate(self.layers):
-            x = layer(x, positions, self.rope, kv_caches[i], meta)
-        return self.norm(x)
+            attn = layer.self_attn.attend(q, k, v, kv_caches[i], meta)
+            x, q, k, v = self.piece(i + 1, input_ids, positions, x, attn)
+        return x
+
+    def piece(
+        self,
+        i: int,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        x: torch.Tensor | None,
+        attn: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Everything between attention call i-1 and attention call i, for i in 0..num_layers.
+
+        Piece i finishes layer i-1 (output projection, residual, MLP) and starts layer i
+        (norm, QKV projection, RoPE). Pieces are row-wise and never touch the KV cache,
+        which is what makes them safe to capture as CUDA graphs with padded rows while
+        attention runs eagerly in between (see cuda_graph.PiecewiseGraphRunner).
+
+        Returns (x, q, k, v); for the last piece, (final hidden states, None, None, None).
+        """
+        if i == 0:
+            x = self.embed_tokens(input_ids)
+        else:
+            assert x is not None and attn is not None
+            prev = self.layers[i - 1]
+            x = x + prev.self_attn.o_proj(attn.flatten(1))
+            x = x + prev.mlp(prev.post_attention_layernorm(x))
+        if i == len(self.layers):
+            return self.norm(x), None, None, None
+        layer = self.layers[i]
+        q, k, v = layer.self_attn.project(layer.input_layernorm(x), positions, self.rope)
+        return x, q, k, v
 
     @torch.inference_mode()
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:

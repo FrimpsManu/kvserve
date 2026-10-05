@@ -127,7 +127,7 @@ def create_app(config: EngineConfig, url: str | None = None) -> FastAPI:
             "cuda_graphs": runner.graphs.max_batch if runner.graphs else None,
             "kv_capacity_tokens": runner.num_kv_blocks * eng.config.block_size,
         }
-        return eng.stats.snapshot() | {"info": info}
+        return eng.stats.snapshot() | {"info": info, "step_paths": dict(runner.step_paths)}
 
     @app.get("/health")
     async def health() -> Response:
