@@ -43,9 +43,12 @@ class ModelRunner:
         self.step_paths: Counter[str] = Counter()  # decode_graph | piecewise | eager
         self.graphs: DecodeGraphRunner | None = None
         self.piecewise: PiecewiseGraphRunner | None = None
+        if self.device.type == "cuda" and self.attn_backend is TritonAttention:
+            self._warmup_kernels()
         if config.enable_cuda_graphs and self.device.type == "cuda" and self.attn_backend is TritonAttention:
             if config.enable_piecewise_graphs:
-                self.piecewise = PiecewiseGraphRunner(self.model, config.max_num_batched_tokens)
+                max_tokens = min(config.max_piecewise_tokens, config.max_num_batched_tokens)
+                self.piecewise = PiecewiseGraphRunner(self.model, max_tokens)
                 self.piecewise.capture()
             self.graphs = DecodeGraphRunner(
                 self.model,
@@ -56,6 +59,35 @@ class ModelRunner:
                 max_blocks_per_seq=-(-config.max_model_len // config.block_size),
             )
             self.graphs.capture()
+
+    @torch.inference_mode()
+    def _warmup_kernels(self) -> None:
+        """JIT-compile Triton kernel variants before serving.
+
+        Triton compiles each kernel specialisation on first use, which otherwise stalls
+        the first real requests by seconds. Runs one prefill-shaped and one decode-shaped
+        forward whose K/V writes and reads all hit the scratch block, so the pool the
+        allocator hands out is never touched.
+        """
+        bs, dev = self.config.block_size, self.device
+        prefill_len = min(64, self.config.max_num_batched_tokens)
+        for query_len, num_seqs in ((prefill_len, 1), (1, 4)):
+            num_tokens = query_len * num_seqs
+            meta = AttentionMetadata(
+                slot_mapping=torch.full((num_tokens,), self.scratch_block * bs, dtype=torch.long, device=dev),
+                block_tables=torch.full(
+                    (num_seqs, -(-query_len // bs)), self.scratch_block, dtype=torch.long, device=dev
+                ),
+                seq_lens=torch.full((num_seqs,), query_len, device=dev),
+                query_lens=torch.full((num_seqs,), query_len, device=dev),
+                query_start_loc=torch.arange(0, num_tokens + 1, query_len, device=dev),
+                max_seq_len=query_len,
+                max_query_len=query_len,
+            )
+            ids = torch.zeros(num_tokens, dtype=torch.long, device=dev)
+            positions = torch.arange(query_len, device=dev).repeat(num_seqs)
+            self.model(ids, positions, self.kv_caches, meta)
+        torch.cuda.synchronize()
 
     def _count(self, path: str) -> None:
         self.step_paths[path] += 1

@@ -128,6 +128,7 @@ def test_piecewise_matches_eager_on_mixed_steps():
 
     eager = run(make(False, dtype="float32", max_num_batched_tokens=24))
     eng = make(True, dtype="float32", max_num_batched_tokens=24)
+    assert eng.runner.piecewise.max_tokens == 24  # capped by the step budget
     assert run(eng) == eager
     paths = eng.runner.step_paths
     assert paths["piecewise"] > 0 and paths["decode_graph"] > 0 and paths["eager"] == 0, paths
@@ -146,3 +147,12 @@ def test_piecewise_matches_hf():
         ids = eng.tokenizer(prompt, return_tensors="pt").input_ids
         ref = hf.generate(ids, max_new_tokens=10, min_new_tokens=10, do_sample=False)[0, ids.shape[1] :]
         assert out == ref.tolist()
+
+
+@pytest.mark.slow
+def test_large_steps_bypass_piecewise():
+    """Steps above max_piecewise_tokens are compute bound and run eagerly."""
+    eng = make(True, max_num_batched_tokens=256, max_piecewise_tokens=64)
+    assert eng.runner.piecewise.max_tokens == 64
+    eng.generate([[1000 + i for i in range(200)]], SamplingParams(temperature=0, max_tokens=2, ignore_eos=True))
+    assert eng.runner.step_paths["eager"] >= 1  # the 200-token prefill

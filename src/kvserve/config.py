@@ -100,6 +100,9 @@ class EngineConfig:
     enable_cuda_graphs: bool = True  # needs CUDA + the triton backend
     max_graph_batch_size: int = 128  # largest decode batch captured (capped at max_num_seqs)
     enable_piecewise_graphs: bool = True  # graphs around attention for mixed/prefill steps
+    # Above ~512 tokens a step is compute bound: graphs save nothing and bucket padding
+    # costs extra GEMM work (measured: 1025 tokens padded to 1280 ran 11% slower than eager).
+    max_piecewise_tokens: int = 512
     seed: int = 0
 
     @property
