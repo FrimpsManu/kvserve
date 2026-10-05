@@ -76,12 +76,27 @@ class IncrementalDetokenizer:
         return out
 
 
-def create_app(config: EngineConfig) -> FastAPI:
+def startup_banner(engine: AsyncLLMEngine, url: str) -> str:
+    runner = engine.engine.runner
+    kv_tokens = runner.num_kv_blocks * engine.config.block_size
+    return (
+        f"kvserve ready at {url}\n"
+        f"  model     {engine.config.model}\n"
+        f"  device    {engine.config.device} ({str(runner.dtype).removeprefix('torch.')}), "
+        f"attention: {runner.attn_backend.__name__}\n"
+        f"  kv cache  {runner.num_kv_blocks} blocks x {engine.config.block_size} = {kv_tokens:,} tokens\n"
+        f"  try       {url}/docs   (interactive API)   {url}/metrics"
+    )
+
+
+def create_app(config: EngineConfig, url: str | None = None) -> FastAPI:
     state: dict[str, AsyncLLMEngine] = {}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         state["engine"] = AsyncLLMEngine(config)
+        if url:
+            print(startup_banner(state["engine"], url), flush=True)
         yield
         state["engine"].shutdown()
 
