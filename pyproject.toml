@@ -1,0 +1,43 @@
+[project]
+name = "kvserve"
+version = "0.1.0"
+description = "LLM inference engine with paged KV cache, continuous batching and prefix caching"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.142.2",
+    "huggingface-hub>=1.33.0",
+    "prometheus-client>=0.26.0",
+    "safetensors>=0.8.0",
+    "tokenizers>=0.21",
+    "torch>=2.8",
+    "transformers>=4.50",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "mypy>=2.4.0",
+    "numpy>=2.5.3",
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: loads the real model (deselect with -m 'not slow')"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[project.scripts]
+kvserve = "kvserve.cli:main"
