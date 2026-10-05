@@ -156,6 +156,18 @@ class KVCacheManager:
         """Flat slot index in the KV pool for token `position` of `seq`."""
         return seq.block_table[position // self.block_size] * self.block_size + position % self.block_size
 
+    def slots(self, seq: Sequence, start: int, n: int) -> list[int]:
+        """Slots for positions [start, start + n), one per block rather than per token."""
+        bs, table = self.block_size, seq.block_table
+        out: list[int] = []
+        pos, end = start, start + n
+        while pos < end:
+            block_end = min(end, (pos // bs + 1) * bs)
+            base = table[pos // bs] * bs - (pos // bs) * bs
+            out.extend(range(base + pos, base + block_end))
+            pos = block_end
+        return out
+
     @property
     def prefix_hit_rate(self) -> float:
         return self.prefix_hits / self.prefix_queries if self.prefix_queries else 0.0
