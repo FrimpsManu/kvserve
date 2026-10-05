@@ -96,6 +96,7 @@ class EngineConfig:
     max_num_batched_tokens: int = 2048  # per-step token budget (chunked prefill)
     max_model_len: int = 4096  # prompt + output cap per sequence
     enable_prefix_caching: bool = True
+    attention_backend: str = "auto"  # auto | torch | triton
     seed: int = 0
 
     @property

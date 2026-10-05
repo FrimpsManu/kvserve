@@ -22,6 +22,7 @@ class AttentionMetadata:
     query_lens: torch.Tensor  # [B] tokens computed this step
     q_gather: torch.Tensor  # [B, max_q] flat index of each query token, 0-padded
     q_valid: torch.Tensor  # [B, max_q] bool, False on padding
+    query_start_loc: torch.Tensor  # [B + 1] offset of each sequence's first token in the flat batch
     max_seq_len: int
     max_query_len: int
 
@@ -72,3 +73,39 @@ class TorchAttention:
         out = out.transpose(1, 2)[meta.q_valid]  # [T, H, D] in flat token order
         assert out.shape[0] == num_tokens and num_seqs == meta.q_valid.shape[0]
         return out
+
+
+class TritonAttention(TorchAttention):
+    """Paged attention via the Triton kernel (NVIDIA/AMD GPUs). K/V writes reuse the torch path."""
+
+    @staticmethod
+    def forward(
+        q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, meta: AttentionMetadata, scale: float
+    ) -> torch.Tensor:
+        from kvserve.kernels.paged_attention import paged_attention
+
+        return paged_attention(
+            q, k_cache, v_cache, meta.block_tables, meta.seq_lens, meta.query_start_loc, meta.max_query_len, scale
+        )
+
+
+def triton_available() -> bool:
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return torch.cuda.is_available()
+
+
+def get_backend(name: str, device: str, block_size: int) -> type[TorchAttention]:
+    if name == "auto":
+        name = "triton" if device.startswith("cuda") and triton_available() and block_size >= 16 else "torch"
+    if name == "torch":
+        return TorchAttention
+    if name == "triton":
+        if not triton_available():
+            raise RuntimeError("triton backend needs a CUDA GPU and the triton package")
+        if block_size < 16:
+            raise ValueError("triton backend needs block_size >= 16 (tl.dot minimum tile)")
+        return TritonAttention
+    raise ValueError(f"unknown attention backend {name!r}")

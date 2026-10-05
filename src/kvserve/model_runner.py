@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from kvserve.attention import AttentionMetadata
+from kvserve.attention import AttentionMetadata, get_backend
 from kvserve.config import EngineConfig, ModelConfig, resolve_model_path
 from kvserve.kv_cache import KVCacheManager
 from kvserve.model import load_model
@@ -21,7 +21,10 @@ class ModelRunner:
         path = resolve_model_path(config.model)
         self.model_path = path
         self.model_config = ModelConfig.from_dir(path)
-        self.model = load_model(path, self.model_config, config.device, self.dtype, config.max_model_len)
+        self.attn_backend = get_backend(config.attention_backend, config.device, config.block_size)
+        self.model = load_model(
+            path, self.model_config, config.device, self.dtype, config.max_model_len, self.attn_backend
+        )
         self.num_kv_blocks = config.num_kv_blocks or self._blocks_for_memory(config.kv_cache_memory_gb)
         mc = self.model_config
         # [layers, k/v, blocks, block_size, kv_heads, head_dim]
@@ -78,10 +81,12 @@ class ModelRunner:
         tables = [seq.block_table + [0] * (max_blocks - len(seq.block_table)) for seq, _ in sched.scheduled]
         max_q = max(query_lens)
         q_gather, q_valid, offset = [], [], 0
+        query_start_loc = [0]
         for n in query_lens:
             q_gather.append(list(range(offset, offset + n)) + [0] * (max_q - n))
             q_valid.append([True] * n + [False] * (max_q - n))
             offset += n
+            query_start_loc.append(offset)
         return AttentionMetadata(
             slot_mapping=torch.tensor(slots, dtype=torch.long, device=dev),
             block_tables=torch.tensor(tables, dtype=torch.long, device=dev),
@@ -89,6 +94,7 @@ class ModelRunner:
             query_lens=torch.tensor(query_lens, device=dev),
             q_gather=torch.tensor(q_gather, dtype=torch.long, device=dev),
             q_valid=torch.tensor(q_valid, device=dev),
+            query_start_loc=torch.tensor(query_start_loc, device=dev),
             max_seq_len=max(seq_lens),
             max_query_len=max_q,
         )
