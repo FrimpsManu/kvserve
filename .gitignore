@@ -8,3 +8,5 @@ wheels/
 
 # Virtual environments
 .venv
+gateway/bin/
+results/.routing_*.log
