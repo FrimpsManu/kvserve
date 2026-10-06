@@ -61,6 +61,8 @@ class LiveStats:
                 "running": self.running,
                 "waiting": self.waiting,
                 "kv_usage": self.kv_usage,
+                "prompt_tokens": self.prompt_tokens,
+                "cached_prompt_tokens": self.cached_prompt_tokens,
                 "prefix_hit_rate": self.cached_prompt_tokens / self.prompt_tokens if self.prompt_tokens else 0.0,
                 "last_step_tokens": self.last_step_tokens,
                 "last_step_ms": self.last_step_ms,
