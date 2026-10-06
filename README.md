@@ -277,6 +277,60 @@ bash bench/compare_vllm.sh
 The pod needs an NVIDIA driver new enough for current vLLM wheels (CUDA 13 hosts);
 kvserve itself pins CUDA 12.8 wheels and runs on driver 570+.
 
+## Distributed serving: kvgateway
+
+`gateway/` is a Go reverse proxy that routes OpenAI-compatible requests across several
+kvserve instances. Each instance has its own prefix cache, so *where* a request runs
+decides whether its shared prefix (a long system prompt, a conversation so far) is
+reused or recomputed.
+
+```bash
+cd gateway && go build -o bin/kvgateway ./cmd/kvgateway
+bin/kvgateway --backends http://gpu0:8000,http://gpu1:8000 --policy prefix_affinity
+```
+
+| Policy | How it picks a backend |
+|---|---|
+| `round_robin` | In turn. Baseline: every instance ends up computing and caching every prefix. |
+| `least_loaded` | Fewest requests in flight from the gateway (instant and exact for one gateway). |
+| `prefix_affinity` | Rendezvous hashing on the prompt's first 512 characters (or 128 token ids), with **bounded loads**: an instance is eligible only below `ceil((1 + eps) * average)` in-flight, so a hot prefix spills to its second choice instead of overloading one instance. |
+
+It streams SSE through without buffering, fails over only on connection errors (never
+after a backend has started generating), health-checks and restores backends, propagates
+client disconnects, and exports Prometheus metrics.
+
+### Does cache-aware routing beat load-based routing?
+
+`bench/compare_routing.sh`: 4 kvserve instances on 2x RTX 4090 (2 per GPU, 1 GB KV cache
+each), EPYC 7763 host. 32 shared prefixes of 1,792 tokens with Zipf popularity (a few hot
+"applications"), ~2,048-token prompts, 128 output tokens. Together the prefixes exceed one
+instance's cache, so routing determines reuse. Instances restart with cold caches for
+every run; means over 3 seeds (2 at 64 req/s), ranges in brackets.
+
+| Rate | Policy | Prefix-cache hit | Prompt tokens recomputed | Output tok/s | TTFT p50 / p99 (ms) | TPOT p50 (ms) |
+|---|---|---|---|---|---|---|
+| 16 req/s | round robin | 59.6% [58.5-61.5] | 40.4% | 1,975 | 46 / 144 | 13.5 |
+| | least loaded | 58.8% [57.1-62.2] | 41.2% | 1,975 | 48 / 159 | 13.4 |
+| | **prefix affinity** | **74.0%** [73.6-74.7] | **26.0%** | 1,973 | 44 / 134 | **12.9** |
+| 32 req/s | round robin | 59.9% [58.9-61.8] | 40.1% | 3,653 | 52 / 252 | 16.2 |
+| | least loaded | 60.7% [60.1-61.4] | 39.3% | 3,663 | 55 / 211 | 16.0 |
+| | **prefix affinity** | **74.9%** [73.6-76.9] | **25.1%** | 3,670 | 48 / 180 | **14.7** |
+| 64 req/s (saturated) | round robin | 63.0% [62.1-63.9] | 37.0% | 4,714 | 2,485 / 3,915 | 18.0 |
+| | least loaded | 62.8% [62.5-63.0] | 37.2% | 4,695 | 2,527 / 3,672 | 18.3 |
+| | **prefix affinity** | **77.7%** [75.8-79.6] | **22.3%** | **5,374** | **1,337 / 1,875** | **16.4** |
+
+- **Prefix affinity recomputes 36-40% fewer prompt tokens** than either baseline at every
+  rate, in all 8 rate and seed combinations.
+- **Below saturation** the fleet has spare capacity, so throughput is unchanged; the saved
+  prefill shows up as 4-9% lower TPOT (less prefill competing with decode) and a slightly
+  lower median TTFT. Tail TTFT at these rates is mixed across seeds, so no tail claim.
+- **At saturation** the saved work becomes capacity: **+14% throughput** (+10% to +18% by
+  seed) and median TTFT **2,485 -> 1,337 ms**.
+- Load-only routing (least loaded) is no better than round robin for cache reuse: it
+  balances queues but scatters prefixes.
+
+Raw data: [`results/routing_2x4090/`](results/routing_2x4090).
+
 ## Testing
 
 ```bash
@@ -304,5 +358,6 @@ that the allocator never leaks or double-frees blocks.
 - [x] Engine in its own process + O(1) incremental detokenisation: +21% burst throughput, 87% of vLLM
 - [ ] Split-KV decode for small batches / long contexts
 - [ ] Tensor parallelism (NCCL)
-- [ ] Go gateway, KV-cache-aware router, disaggregated prefill/decode
+- [x] Go gateway with prefix-affinity routing: 36-40% less prompt recompute, +14% throughput at saturation vs round robin
+- [ ] Disaggregated prefill/decode
 - [ ] Speculative decoding, FP8 KV cache

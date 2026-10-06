@@ -39,16 +39,45 @@ class RequestResult:
 
 
 def make_prompts(args: argparse.Namespace, vocab_size: int) -> list[tuple[list[int], int]]:
-    """Random token prompts; `--shared-prefix-len` tokens are identical across all prompts."""
+    """Random token prompts.
+
+    `--shared-prefix-len` tokens at the start of each prompt are shared. With
+    `--num-prefixes K`, there are K distinct shared prefixes (think K applications,
+    each with its own long system prompt) and each request draws one, uniformly or
+    Zipf-distributed so a few prefixes are hot. This is the workload where routing
+    decides whether backends reuse each other's work or each recompute everything.
+    """
     rng = random.Random(args.seed)
-    prefix = [rng.randrange(1000, vocab_size - 1000) for _ in range(args.shared_prefix_len)]
+
+    def tokens(n: int) -> list[int]:
+        return [rng.randrange(1000, vocab_size - 1000) for _ in range(n)]
+
+    num_prefixes = max(1, args.num_prefixes)
+    prefixes = [tokens(args.shared_prefix_len) for _ in range(num_prefixes)]
+    if args.prefix_dist == "zipf":
+        weights = [1.0 / (rank + 1) ** args.zipf_s for rank in range(num_prefixes)]
+    else:
+        weights = [1.0] * num_prefixes
     prompts = []
     for _ in range(args.num_prompts):
         n_in = max(1, int(args.input_len * rng.uniform(1 - args.range_ratio, 1 + args.range_ratio)))
         n_out = max(1, int(args.output_len * rng.uniform(1 - args.range_ratio, 1 + args.range_ratio)))
-        body = [rng.randrange(1000, vocab_size - 1000) for _ in range(max(0, n_in - len(prefix)))]
-        prompts.append((prefix + body, n_out))
+        prefix = rng.choices(prefixes, weights)[0]
+        prompts.append((prefix + tokens(max(0, n_in - len(prefix))), n_out))
     return prompts
+
+
+async def cache_counters(client: httpx.AsyncClient, urls: list[str]) -> tuple[int, int] | None:
+    """Summed (prompt_tokens, cached_prompt_tokens) across kvserve backends' /stats."""
+    total = cached = 0
+    for url in urls:
+        try:
+            s = (await client.get(f"{url.rstrip('/')}/stats")).json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        total += s.get("prompt_tokens", 0)
+        cached += s.get("cached_prompt_tokens", 0)
+    return total, cached
 
 
 async def send(client: httpx.AsyncClient, url: str, model: str, prompt: list[int], max_tokens: int) -> RequestResult:
@@ -105,6 +134,7 @@ async def run(args: argparse.Namespace) -> dict:
         # Warm up so model compilation / caches do not pollute the measurement.
         await send(client, url, model, prompts[0][0][:16], 4)
         paths_before = await step_paths(client, base)
+        cache_before = await cache_counters(client, args.stats_urls) if args.stats_urls else None
 
         tasks = []
         start = time.perf_counter()
@@ -115,7 +145,12 @@ async def run(args: argparse.Namespace) -> dict:
         results = await asyncio.gather(*tasks)
         duration = time.perf_counter() - start
         paths_after = await step_paths(client, base)
+        cache_after = await cache_counters(client, args.stats_urls) if args.stats_urls else None
     summary = summarize(args, model, results, duration)
+    if cache_before is not None and cache_after is not None:
+        prompt, cached = cache_after[0] - cache_before[0], cache_after[1] - cache_before[1]
+        summary["prefix_cache"] = {"prompt_tokens": prompt, "cached_tokens": cached,
+                                   "hit_rate": cached / prompt if prompt else 0.0}  # fmt: skip
     if paths_before is not None and paths_after is not None:
         summary["step_paths"] = {k: v - paths_before.get(k, 0) for k, v in paths_after.items()}
     return summary
@@ -183,6 +218,10 @@ def report(s: dict) -> None:
         st = s[key]
         if st:
             print(f"{key:<8} mean {st['mean']:9.1f}  p50 {st['p50']:9.1f}  p90 {st['p90']:9.1f}  p99 {st['p99']:9.1f}")
+    if s.get("prefix_cache"):
+        pc = s["prefix_cache"]
+        tokens = f"{pc['cached_tokens']}/{pc['prompt_tokens']} prompt tokens"
+        print(f"prefix cache hit     {100 * pc['hit_rate']:8.1f} %  ({tokens})")
     if s.get("step_paths"):
         total = sum(s["step_paths"].values()) or 1
         print("steps    " + "  ".join(f"{k} {v} ({100 * v / total:.0f}%)" for k, v in sorted(s["step_paths"].items())))
@@ -200,6 +239,11 @@ def main() -> None:
     p.add_argument("--output-len", type=int, default=128)
     p.add_argument("--range-ratio", type=float, default=0.0, help="uniform +/- jitter on lengths")
     p.add_argument("--shared-prefix-len", type=int, default=0, help="common prefix tokens (prefix caching)")
+    p.add_argument("--num-prefixes", type=int, default=1, help="distinct shared prefixes (e.g. system prompts)")
+    p.add_argument("--prefix-dist", choices=["uniform", "zipf"], default="uniform", help="how requests pick a prefix")
+    p.add_argument("--zipf-s", type=float, default=1.1, help="Zipf exponent for --prefix-dist zipf")
+    p.add_argument("--stats-urls", type=lambda v: [u for u in v.split(",") if u], default=[],
+                   help="kvserve backends to read prefix-cache counters from (e.g. behind a gateway)")  # fmt: skip
     p.add_argument("--vocab-size", type=int, default=128000)
     p.add_argument("--slo-ttft-ms", type=float, default=1000)
     p.add_argument("--slo-tpot-ms", type=float, default=100)
