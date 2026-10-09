@@ -1,5 +1,7 @@
 """Speculative decoding: n-gram proposals, draft scheduling, and output invariance."""
 
+import gc
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -67,8 +69,6 @@ def _free_memory():
     # Engines hold reference cycles; collect them so tests that load two models (target
     # + draft, or + an HF reference) don't stack on the previous test's (CI has 16 GB).
     yield
-    import gc
-
     gc.collect()
 
 
@@ -231,6 +231,9 @@ def test_speculative_stream_matches_plain_and_reports_acceptance(engine_mode):
         with TestClient(app) as c, c.stream("POST", "/v1/completions", json=body) as r:
             texts.append("".join(e["choices"][0]["text"] for e in sse_events(r)))
             stats = c.get("/stats").json()
+        # In thread mode the engine lives in this process: release it before the next one loads.
+        del app, c, r
+        gc.collect()
     assert texts[0] == texts[1] and texts[0]
     assert stats["info"]["speculative"] == "ngram lookup, 4 tokens per step"
     assert 0 < stats["spec_accepted_tokens"] <= stats["spec_draft_tokens"]
