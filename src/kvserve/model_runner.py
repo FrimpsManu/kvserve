@@ -6,7 +6,7 @@ from collections import Counter
 
 import torch
 
-from kvserve.attention import AttentionMetadata, TritonAttention, get_backend
+from kvserve.attention import AttentionMetadata, TorchAttention, TritonAttention, get_backend
 from kvserve.config import EngineConfig, ModelConfig, resolve_model_path
 from kvserve.cuda_graph import DecodeGraphRunner, PiecewiseGraphRunner
 from kvserve.kv_cache import KVCacheManager
@@ -155,27 +155,40 @@ class ModelRunner:
     def _build_metadata(
         self, sched: SchedulerOutput, slots: list[int], seq_lens: list[int], query_lens: list[int]
     ) -> AttentionMetadata:
-        dev = self.device
-        max_blocks = max(len(seq.block_table) for seq, _ in sched.scheduled)
-        tables = [seq.block_table + [0] * (max_blocks - len(seq.block_table)) for seq, _ in sched.scheduled]
-        max_q = max(query_lens)
-        query_start_loc = [0]
-        for n in query_lens:
-            query_start_loc.append(query_start_loc[-1] + n)
-        meta = AttentionMetadata(
-            slot_mapping=torch.tensor(slots, dtype=torch.long, device=dev),
-            block_tables=torch.tensor(tables, dtype=torch.long, device=dev),
-            seq_lens=torch.tensor(seq_lens, device=dev),
-            query_lens=torch.tensor(query_lens, device=dev),
-            query_start_loc=torch.tensor(query_start_loc, device=dev),
-            max_seq_len=max(seq_lens),
-            max_query_len=max_q,
-        )
-        if self.attn_backend is not TritonAttention:  # padded layout for the torch reference only
-            q_gather, q_valid = [], []
-            for start, n in zip(query_start_loc, query_lens, strict=False):
-                q_gather.append(list(range(start, start + n)) + [0] * (max_q - n))
-                q_valid.append([True] * n + [False] * (max_q - n))
-            meta.q_gather = torch.tensor(q_gather, dtype=torch.long, device=dev)
-            meta.q_valid = torch.tensor(q_valid, device=dev)
-        return meta
+        tables = [seq.block_table for seq, _ in sched.scheduled]
+        return build_metadata(self.device, self.attn_backend, tables, slots, seq_lens, query_lens)
+
+
+def build_metadata(
+    device: torch.device,
+    backend: type[TorchAttention],
+    block_tables: list[list[int]],
+    slots: list[int],
+    seq_lens: list[int],
+    query_lens: list[int],
+) -> AttentionMetadata:
+    """Attention metadata for a flat batch: sequence i contributes query_lens[i] tokens."""
+    dev = device
+    max_blocks = max(len(t) for t in block_tables)
+    tables = [t + [0] * (max_blocks - len(t)) for t in block_tables]
+    max_q = max(query_lens)
+    query_start_loc = [0]
+    for n in query_lens:
+        query_start_loc.append(query_start_loc[-1] + n)
+    meta = AttentionMetadata(
+        slot_mapping=torch.tensor(slots, dtype=torch.long, device=dev),
+        block_tables=torch.tensor(tables, dtype=torch.long, device=dev),
+        seq_lens=torch.tensor(seq_lens, device=dev),
+        query_lens=torch.tensor(query_lens, device=dev),
+        query_start_loc=torch.tensor(query_start_loc, device=dev),
+        max_seq_len=max(seq_lens),
+        max_query_len=max_q,
+    )
+    if backend is not TritonAttention:  # padded layout for the torch reference only
+        q_gather, q_valid = [], []
+        for start, n in zip(query_start_loc, query_lens, strict=False):
+            q_gather.append(list(range(start, start + n)) + [0] * (max_q - n))
+            q_valid.append([True] * n + [False] * (max_q - n))
+        meta.q_gather = torch.tensor(q_gather, dtype=torch.long, device=dev)
+        meta.q_valid = torch.tensor(q_valid, device=dev)
+    return meta
