@@ -5,7 +5,9 @@ batching with chunked prefill, prefix caching, recompute preemption, a Triton
 paged-attention kernel, decode and piecewise CUDA graphs, and an OpenAI-compatible
 streaming server whose engine runs in its own process. Benchmarked head-to-head against
 vLLM on the same GPU: **98-100% of vLLM's goodput up to 32 req/s and 87% of its burst
-throughput** on an RTX 4090 (Ryzen 9 7950X host).
+throughput** on an RTX 4090 (Ryzen 9 7950X host). Speculative decoding (n-gram lookup
+or a draft model) makes Llama-3.1-8B **1.65x faster on chat and up to 2.5x faster on
+grounded tasks** at batch 1.
 
 Every scheduling optimisation is verified to be **output-invariant**: generations are
 token-for-token identical to Hugging Face `transformers` under batching, chunked
@@ -50,6 +52,7 @@ prefill, preemption and prefix caching.
 | Engine in its own process, ZeroMQ IPC, one message per step | API server and engine no longer share a GIL; IPC cost scales with steps, not tokens x requests (`--engine-mode thread` keeps the single-process design) |
 | CUDA graphs: full graphs for decode, piecewise graphs around attention for mixed steps | Decode was launch bound (~300 kernel launches per step); piecewise graphs extend that to steps mixing prefill and decode |
 | Fused QKV and gate/up projections | Fewer, larger GEMMs: better hardware utilisation |
+| Speculative drafts ride the chunked-prefill path; the draft model shares the target's block tables | Verification is just a multi-token step, and rejected K/V sits past `num_computed_tokens`, so nothing rolls back; one allocator manages both models' caches |
 
 ## Demo
 
@@ -104,7 +107,7 @@ uv run python bench/bench_serving.py --base-url http://localhost:8000 \
   --num-prompts 64 --input-len 256 --output-len 64
 ```
 
-All GPU results: RTX 4090 (24 GB), Llama-3.2-1B-Instruct, bf16, block size 16. Raw data
+All GPU results: RTX 4090 (24 GB), Llama-3.2-1B-Instruct (speculative decoding: Llama-3.1-8B), bf16, block size 16. Raw data
 in [`results/rtx4090/`](results/rtx4090).
 
 ### Paged attention kernel (decode)
@@ -250,6 +253,63 @@ Earlier results on other hosts are kept in [`results/rtx4090/`](results/rtx4090)
 graphs vs eager vs vLLM 0.30 (EPYC 7532) and the pre-graphs baseline (EPYC 75F3). For a
 launch-bound engine the host CPU changes results, so only same-host numbers are compared.
 
+### Speculative decoding (Llama-3.1-8B, RTX 4090)
+
+A decoding sequence proposes k draft tokens; the target scores its pending token and
+all drafts in one forward pass (the same multi-token path as chunked prefill) and
+rejection sampling keeps the longest agreeing prefix plus one token of its own, so a
+step emits 1 to k + 1 tokens. Rejection sampling keeps the target's output
+distribution exactly; greedy decoding stays token-for-token identical.
+
+Two proposers: **n-gram lookup** (`--speculative-method ngram`) matches the last 2-4
+tokens earlier in the context and proposes what followed: free, and strong when the
+output copies its input. A **draft model** (`--speculative-method draft --draft-model
+unsloth/Llama-3.2-1B-Instruct`) runs a small model with its own K/V pool indexed by the
+target's block tables, so the target's allocator, preemption and prefix caching cover
+it too; its k - 1 single-token passes replay CUDA graphs.
+
+`bench/bench_spec.py`: Llama-3.1-8B-Instruct target, bf16, greedy, up to 256 output
+tokens, k = 4, real chat-formatted prompts. *chat* is 16 open-ended questions;
+*grounded* is 8 code edits, summaries and extractions over a given document. Speedup is
+end-to-end output throughput (prefill included); per-request decode is tokens after the
+first over the time after the first, the speed a streaming user sees.
+
+| Workload | Method | Batch 1 | Batch 8 | Batch 32 | Acceptance | Tokens per verify |
+|---|---|---|---|---|---|---|
+| chat | none | 57 tok/s | 399 tok/s | 1,427 tok/s | | |
+| chat | n-gram | 1.08x | 0.98x | 0.91x | 21% | 1.8 |
+| chat | draft 1B | **1.65x** | 1.21x (decode 1.45x) | 1.15x (decode 1.37x) | 65% | 3.6 |
+| grounded | none | 53 tok/s | 400 tok/s | 1,424 tok/s | | |
+| grounded | n-gram | **2.21x** (decode 2.55x) | 1.32x (decode 2.32x) | 1.19x (decode 1.98x) | 61-64% | 3.6 |
+| grounded | draft 1B | 1.80x | 1.29x (decode 1.72x) | 1.23x (decode 1.51x) | 82-85% | 4.3 |
+
+- **Batch 1 is where speculation pays**: an 8B decode step is memory bound (18.5 ms),
+  and verifying 5 tokens costs about the same as decoding 1 (20.4 ms measured).
+- **The gain shrinks with batch size** as steps become compute bound and verification
+  work stops being free. End-to-end throughput falls faster than per-request decode
+  speed because requests run in waves that last as long as their longest member.
+- **N-gram needs copyable output.** On open-ended chat it rarely matches (21%
+  acceptance) and costs up to 10% at batch 32; on grounded tasks it beats the draft
+  model at no cost at all. The draft model helps both.
+
+Tokens per step (k), batch 1, end-to-end speedup:
+
+| k | n-gram, grounded | draft, chat | draft, grounded |
+|---|---|---|---|
+| 2 | 1.86x | 1.37x | 1.45x |
+| 4 | 2.21x | 1.65x | 1.80x |
+| 6 | **2.47x** (decode 3.11x) | **1.73x** | **1.93x** |
+
+Larger k keeps paying at batch 1; at batch 8 k = 4 and k = 6 are about equal (1.32x / 1.37x
+n-gram grounded, 1.21x / 1.20x draft chat), so the default stays k = 4.
+
+**Exactness.** In fp32 on the GPU, every output of every method at every batch size is
+token-identical to decoding without speculation (192 / 192, Llama-3.2-1B). In bf16
+some long greedy outputs diverge (e.g. 4 / 16 chat outputs identical at batch 1):
+scoring k + 1 tokens in one pass rounds differently from scoring one, which can flip a
+near-tie, after which the continuations differ. Raw data in
+[`results/spec_rtx4090/`](results/spec_rtx4090).
+
 ### Apple M5 Pro (MPS), development baseline
 
 Torch reference attention, 64 concurrent requests:
@@ -272,6 +332,7 @@ uv run pytest                                      # 61 tests incl. GPU kernel, 
 uv run python bench/bench_decode.py                # eager vs CUDA graph decode step
 uv run python bench/bench_kernel.py --peak-gbps 1008
 bash bench/compare_vllm.sh
+uv run python bench/bench_spec.py --kv-gb 2         # speculative decoding, 8B target + 1B draft
 ```
 
 The pod needs an NVIDIA driver new enough for current vLLM wheels (CUDA 13 hosts);
@@ -340,7 +401,13 @@ uv run pytest                 # + token-exact comparison against HF transformers
 
 The slow suite asserts identical greedy output to `transformers` for: batched vs. single
 requests, chunked prefill with a 3-token budget, heavy preemption with a 10-block pool,
-and prefix-cache hits vs. a cold cache. On CUDA, the same comparison runs end to end
+and prefix-cache hits vs. a cold cache. Speculative decoding is checked the same way:
+greedy output with n-gram or draft-model speculation equals output without it under a
+tight token budget, preemption, prefix caching and stop tokens, using the target as
+its own draft (near-total acceptance) and a tiny random-weight draft (mostly rejected).
+At every step the draft model's first proposal must match running it from scratch,
+which catches stale draft K/V after full acceptance, rejection or preemption, and the
+rejection sampler is checked statistically to reproduce the target distribution. On CUDA, the same comparison runs end to end
 through the Triton kernel (fp32, IEEE dots). The kernel is also tested against the
 torch reference on shuffled page layouts across decode, prefill, chunked prefill, mixed
 batches, long contexts, GQA ratios, dtypes and head sizes. A randomized test checks
@@ -360,4 +427,5 @@ that the allocator never leaks or double-frees blocks.
 - [ ] Tensor parallelism (NCCL)
 - [x] Go gateway with prefix-affinity routing: 36-40% less prompt recompute, +14% throughput at saturation vs round robin
 - [ ] Disaggregated prefill/decode
-- [ ] Speculative decoding, FP8 KV cache
+- [x] Speculative decoding (n-gram and draft model): 1.65x on chat, up to 2.5x on grounded tasks at batch 1 (Llama-3.1-8B)
+- [ ] FP8 KV cache

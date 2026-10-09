@@ -86,6 +86,7 @@ def chat_ids(eng: LLMEngine, prompt: str) -> list[int]:
 def build(args: argparse.Namespace, method: str) -> LLMEngine:
     cfg = EngineConfig(
         model=args.model,
+        dtype=args.dtype,
         kv_cache_memory_gb=args.kv_gb,
         max_num_seqs=max(args.batch_sizes),
         max_model_len=args.max_model_len,
@@ -146,12 +147,16 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--kv-gb", type=float, default=3.0)
+    ap.add_argument("--dtype", default="auto", help="float32 checks exactness: bf16 rounding can flip near-ties")
     ap.add_argument("--repeat", type=int, default=1, help="cycle each workload's prompts this many times")
     ap.add_argument("--output", type=Path)
     args = ap.parse_args()
 
     params = SamplingParams(temperature=0, max_tokens=args.max_tokens)
     gpu = torch.cuda.get_device_name() if torch.cuda.is_available() else "none"
+    if args.output:  # rows are appended as they finish, so a crash keeps what ran
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text("")
     rows: list[dict] = []
     baseline: dict[tuple[str, int], dict] = {}
     for method in args.methods:
@@ -175,7 +180,8 @@ def main() -> None:
                 base = baseline.setdefault((name, batch), r) if method == "none" else baseline.get((name, batch))
                 same = sum(a == b for a, b in zip(r["outputs"], base["outputs"], strict=True)) if base else None
                 row = {
-                    "gpu": gpu, "model": args.model, "method": method, "workload": name, "batch": batch,
+                    "gpu": gpu, "model": args.model, "dtype": args.dtype, "method": method, "workload": name,
+                    "batch": batch,
                     "k": {"none": 0, "ngram": args.k_ngram, "draft": args.k_draft}[method],
                     "draft_model": args.draft_model if method == "draft" else None, "requests": n,
                     **{key: v for key, v in r.items() if key != "outputs"},
@@ -186,6 +192,9 @@ def main() -> None:
                     "identical_outputs": f"{same}/{n}" if same is not None else None,
                 }  # fmt: skip
                 rows.append(row)
+                if args.output:
+                    with args.output.open("a") as f:
+                        f.write(json.dumps(row) + "\n")
                 acc = f"{row['acceptance']:.0%}" if row["acceptance"] is not None else "-"
                 tpv = f"{row['tokens_per_verify']:.2f}" if row["tokens_per_verify"] else "-"
                 spd = f"{row['speedup']:.2f}x" if row["speedup"] else "-"
@@ -198,12 +207,6 @@ def main() -> None:
                 )
         del eng
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with args.output.open("w") as f:
-            for row in rows:
-                f.write(json.dumps(row) + "\n")
 
 
 if __name__ == "__main__":
