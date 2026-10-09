@@ -40,7 +40,15 @@ def engine_info(engine: LLMEngine) -> dict[str, Any]:
         "kv_blocks": runner.num_kv_blocks,
         "block_size": engine.config.block_size,
         "kv_capacity_tokens": runner.num_kv_blocks * engine.config.block_size,
+        "speculative": _describe_speculation(engine.config),
     }
+
+
+def _describe_speculation(c: EngineConfig) -> str | None:
+    if c.speculative_method == "none":
+        return None
+    source = f"draft model {c.draft_model}" if c.speculative_method == "draft" else "ngram lookup"
+    return f"{source}, {c.num_speculative_tokens} tokens per step"
 
 
 class EngineClient(Protocol):

@@ -96,3 +96,19 @@ def test_engine_process_crash_is_reported():
         assert c.get("/health").status_code == 503
         r = c.post("/v1/completions", json={"prompt": "Hi", "max_tokens": 2})
         assert r.status_code >= 500
+
+
+@pytest.mark.parametrize("engine_mode", ["process", "thread"])
+def test_speculative_stream_matches_plain_and_reports_acceptance(engine_mode):
+    body = {"prompt": "Repeat exactly: one two three four five six. one two three four", "max_tokens": 24,
+            "temperature": 0, "stream": True}  # fmt: skip
+    texts = []
+    for spec in ("none", "ngram"):
+        config = EngineConfig(device="cpu", num_kv_blocks=256, speculative_method=spec)
+        app = create_app(config, engine_mode=engine_mode)
+        with TestClient(app) as c, c.stream("POST", "/v1/completions", json=body) as r:
+            texts.append("".join(e["choices"][0]["text"] for e in sse_events(r)))
+            stats = c.get("/stats").json()
+    assert texts[0] == texts[1] and texts[0]
+    assert stats["info"]["speculative"] == "ngram lookup, 4 tokens per step"
+    assert 0 < stats["spec_accepted_tokens"] <= stats["spec_draft_tokens"]

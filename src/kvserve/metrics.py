@@ -9,6 +9,8 @@ prompt_tokens_total = Counter("kvserve_prompt_tokens_total", "Prompt tokens rece
 cached_prompt_tokens_total = Counter("kvserve_cached_prompt_tokens_total", "Prompt tokens served from prefix cache")
 generation_tokens_total = Counter("kvserve_generation_tokens_total", "Tokens generated")
 steps_total = Counter("kvserve_steps_total", "Engine steps by execution path", ["path"])
+spec_draft_tokens_total = Counter("kvserve_spec_draft_tokens_total", "Speculative draft tokens verified")
+spec_accepted_tokens_total = Counter("kvserve_spec_accepted_tokens_total", "Speculative draft tokens accepted")
 preemptions_total = Counter("kvserve_preemptions_total", "Sequences preempted for lack of KV blocks")
 
 ttft_seconds = Histogram("kvserve_time_to_first_token_seconds", "Time to first token", buckets=_LATENCY_BUCKETS)

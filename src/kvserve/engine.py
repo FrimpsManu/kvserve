@@ -34,6 +34,8 @@ class StepStats:
     num_preempted: int
     duration_s: float
     kv_usage: float
+    num_draft_tokens: int = 0  # speculative decoding: drafts verified this step
+    num_accepted_tokens: int = 0  # of which accepted
 
 
 class LLMEngine:
@@ -99,6 +101,7 @@ class LLMEngine:
         sampled = self.runner.execute(sched, self.kv)
 
         outputs = []
+        step_drafts = step_accepted = 0
         for seq, n in sched.scheduled:
             num_drafts = len(seq.spec_token_ids)
             seq.spec_token_ids, seq.spec_draft_probs = [], None
@@ -111,8 +114,8 @@ class LLMEngine:
             seq.num_computed_tokens += len(tokens) - 1
             seq.num_draft_tokens += num_drafts
             seq.num_accepted_tokens += len(tokens) - 1
-            self.num_draft_tokens += num_drafts
-            self.num_accepted_tokens += len(tokens) - 1
+            step_drafts += num_drafts
+            step_accepted += len(tokens) - 1
             new_tokens, reason = [], None
             for token in tokens:
                 seq.append_token(token)
@@ -137,8 +140,16 @@ class LLMEngine:
                     seq.num_cached_prompt_tokens,
                 )  # fmt: skip
             )
+        self.num_draft_tokens += step_drafts
+        self.num_accepted_tokens += step_accepted
         self.last_step = StepStats(
-            sched.num_tokens, len(sched.scheduled), sched.num_preempted, time.perf_counter() - start, self.kv.usage
+            sched.num_tokens,
+            len(sched.scheduled),
+            sched.num_preempted,
+            time.perf_counter() - start,
+            self.kv.usage,
+            step_drafts,
+            step_accepted,
         )
         return outputs
 
