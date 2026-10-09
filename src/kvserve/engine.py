@@ -36,6 +36,7 @@ class StepStats:
     kv_usage: float
     num_draft_tokens: int = 0  # speculative decoding: drafts verified this step
     num_accepted_tokens: int = 0  # of which accepted
+    num_verifying_seqs: int = 0  # sequences that verified drafts this step
 
 
 class LLMEngine:
@@ -52,6 +53,7 @@ class LLMEngine:
         self._ids = itertools.count()
         self.num_draft_tokens = 0  # speculative decoding, lifetime totals
         self.num_accepted_tokens = 0
+        self.num_verify_steps = 0  # sequence-steps that verified drafts
 
     def _make_proposer(self) -> NgramProposer | DraftModelProposer | None:
         c = self.config
@@ -101,7 +103,7 @@ class LLMEngine:
         sampled = self.runner.execute(sched, self.kv)
 
         outputs = []
-        step_drafts = step_accepted = 0
+        step_drafts = step_accepted = step_verifying = 0
         for seq, n in sched.scheduled:
             num_drafts = len(seq.spec_token_ids)
             seq.spec_token_ids, seq.spec_draft_probs = [], None
@@ -116,6 +118,7 @@ class LLMEngine:
             seq.num_accepted_tokens += len(tokens) - 1
             step_drafts += num_drafts
             step_accepted += len(tokens) - 1
+            step_verifying += num_drafts > 0
             new_tokens, reason = [], None
             for token in tokens:
                 seq.append_token(token)
@@ -142,6 +145,7 @@ class LLMEngine:
             )
         self.num_draft_tokens += step_drafts
         self.num_accepted_tokens += step_accepted
+        self.num_verify_steps += step_verifying
         self.last_step = StepStats(
             sched.num_tokens,
             len(sched.scheduled),
@@ -150,6 +154,7 @@ class LLMEngine:
             self.kv.usage,
             step_drafts,
             step_accepted,
+            step_verifying,
         )
         return outputs
 
