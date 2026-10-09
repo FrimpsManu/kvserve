@@ -13,7 +13,7 @@ from kvserve.kv_cache import KVCacheManager
 from kvserve.model_runner import ModelRunner
 from kvserve.scheduler import Scheduler
 from kvserve.sequence import FinishReason, SamplingParams, Sequence
-from kvserve.spec_decode import NgramProposer
+from kvserve.spec_decode import DraftModelProposer, NgramProposer
 
 
 @dataclass
@@ -51,13 +51,17 @@ class LLMEngine:
         self.num_draft_tokens = 0  # speculative decoding, lifetime totals
         self.num_accepted_tokens = 0
 
-    def _make_proposer(self) -> NgramProposer | None:
+    def _make_proposer(self) -> NgramProposer | DraftModelProposer | None:
         c = self.config
         if c.speculative_method == "none" or c.num_speculative_tokens < 1:
             return None
         if c.speculative_method == "ngram":
             return NgramProposer(c.num_speculative_tokens, c.max_model_len, c.ngram_max, c.ngram_min)
-        raise ValueError(f"unknown speculative_method {c.speculative_method!r} (none | ngram)")
+        if c.speculative_method == "draft":
+            if not c.draft_model:
+                raise ValueError("speculative_method 'draft' needs --draft-model")
+            return DraftModelProposer(c, self.runner, self.kv)
+        raise ValueError(f"unknown speculative_method {c.speculative_method!r} (none | ngram | draft)")
 
     def add_request(
         self, prompt: str | list[int], params: SamplingParams | None = None, request_id: str | None = None
@@ -97,7 +101,7 @@ class LLMEngine:
         outputs = []
         for seq, n in sched.scheduled:
             num_drafts = len(seq.spec_token_ids)
-            seq.spec_token_ids = []
+            seq.spec_token_ids, seq.spec_draft_probs = [], None
             seq.num_computed_tokens += n - num_drafts
             tokens = sampled.get(seq)
             if tokens is None:

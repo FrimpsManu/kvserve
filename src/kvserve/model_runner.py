@@ -149,7 +149,10 @@ class ModelRunner:
             tokens = sample(logits, params, self.generator)
             return {seq: [t] for seq, t in zip(sample_seqs, tokens, strict=True)}
         drafts = [s.spec_token_ids for s in sample_seqs]
-        emitted = rejection_sample(logits, drafts, params, self.generator)
+        draft_probs = [
+            s.spec_draft_probs[: len(s.spec_token_ids)] if s.spec_draft_probs is not None else None for s in sample_seqs
+        ]
+        emitted = rejection_sample(logits, drafts, params, self.generator, draft_probs)
         return dict(zip(sample_seqs, emitted, strict=True))
 
     def _build_metadata(

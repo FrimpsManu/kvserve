@@ -103,3 +103,98 @@ def test_ngram_sampling_respects_max_tokens():
     params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=17, ignore_eos=True)
     outs = make_engine(speculative_method="ngram").generate(PROMPTS, params)
     assert all(len(o) == 17 for o in outs)
+
+
+TARGET = "unsloth/Llama-3.2-1B-Instruct"
+
+
+@pytest.fixture(scope="module")
+def random_draft(tmp_path_factory) -> str:
+    """A tiny random-weight Llama with the target's vocab: a draft that is mostly wrong."""
+    import torch
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from kvserve.config import resolve_model_path
+
+    cfg = LlamaConfig.from_pretrained(resolve_model_path(TARGET))
+    tiny = LlamaConfig(
+        vocab_size=cfg.vocab_size, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=cfg.max_position_embeddings,
+        tie_word_embeddings=True, eos_token_id=cfg.eos_token_id,
+    )  # fmt: skip
+    torch.manual_seed(0)
+    path = tmp_path_factory.mktemp("tiny-draft")
+    LlamaForCausalLM(tiny).save_pretrained(path)
+    return str(path)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("draft", ["same", "random"])
+@pytest.mark.parametrize(
+    "overrides",
+    [{}, {"max_num_batched_tokens": 7}, {"num_kv_blocks": 20, "block_size": 4}],
+    ids=["default", "tight-budget", "preemption"],
+)
+def test_draft_model_greedy_is_output_invariant(reference, random_draft, draft, overrides):
+    model = TARGET if draft == "same" else random_draft
+    eng = make_engine(speculative_method="draft", draft_model=model, **overrides)
+    assert eng.generate(PROMPTS, GREEDY) == reference
+    rate = eng.num_accepted_tokens / eng.num_draft_tokens
+    # The target drafting for itself agrees almost always; a random draft almost never.
+    assert rate > 0.9 if draft == "same" else rate < 0.5
+
+
+@pytest.mark.slow
+def test_draft_model_sampling_with_rejections(random_draft):
+    params = SamplingParams(temperature=1.0, max_tokens=25, ignore_eos=True)
+    eng = make_engine(speculative_method="draft", draft_model=random_draft)
+    outs = eng.generate(PROMPTS, params)
+    assert all(len(o) == 25 for o in outs)
+    assert 0 < eng.num_accepted_tokens < eng.num_draft_tokens
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("draft", ["same", "random"])  # mostly full acceptance / mostly rejection
+@pytest.mark.parametrize("num_kv_blocks", [256, 20], ids=["roomy", "preemption"])
+def test_draft_kv_cache_stays_consistent(random_draft, draft, num_kv_blocks):
+    """The draft's K/V must always match its tokens: after full acceptance (d_k was never
+    fed back), after rejections (rewind), and after preemption (blocks freed). Stale K/V
+    would make its first proposal differ from running the draft from scratch."""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    model = TARGET if draft == "same" else random_draft
+    hf = AutoModelForCausalLM.from_pretrained(resolve(model), dtype=torch.float32).eval()
+    eng = make_engine(speculative_method="draft", draft_model=model, block_size=4, num_kv_blocks=num_kv_blocks)
+    for p in PROMPTS[:2]:
+        eng.add_request(p, GREEDY)
+    checked = preempted = 0
+    while eng.has_unfinished():
+        decoding = [s for s in eng.scheduler.running if s.num_tokens - s.num_computed_tokens == 1]
+        eng.proposer.propose(decoding)
+        for seq in decoding:
+            if seq.spec_token_ids:
+                with torch.no_grad():
+                    logits = hf(torch.tensor([seq.token_ids])).logits[0, -1]
+                assert seq.spec_token_ids[0] == int(logits.argmax()), seq
+                checked += 1
+        eng.proposer = _Frozen(eng.proposer)  # step() must reuse these proposals, not redraw
+        eng.step()
+        eng.proposer = eng.proposer.inner
+        preempted += eng.last_step.num_preempted if eng.last_step else 0
+    assert checked > 10
+    assert (preempted > 0) == (num_kv_blocks == 20)
+
+
+def resolve(model: str) -> str:
+    from kvserve.config import resolve_model_path
+
+    return str(resolve_model_path(model))
+
+
+class _Frozen:
+    def __init__(self, inner):
+        self.inner = inner
+
+    def propose(self, seqs):
+        pass

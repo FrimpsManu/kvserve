@@ -101,6 +101,7 @@ class Scheduler:
         self.kv.free(seq)
         seq.num_computed_tokens = 0
         seq.spec_token_ids = []
+        seq.num_draft_computed = 0
         seq.status = SequenceStatus.WAITING
         seq.num_preemptions += 1
         self.waiting.appendleft(seq)
