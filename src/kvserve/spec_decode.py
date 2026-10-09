@@ -68,11 +68,12 @@ class DraftModelProposer:
     there is no second allocator and preemption or freeing covers the draft too. Each
     sequence records how many of its tokens have draft K/V (`num_draft_computed`).
 
-    Per step: one catch-up pass feeds the draft every token it has not seen yet (the
-    whole prompt after admission, then usually the 1-2 tokens emitted by the last
-    verification) and samples d_1; then k - 1 single-token passes sample d_2..d_k,
-    replayed as CUDA graphs on GPU. Draft K/V for rejected drafts is discarded the same
-    way as the target's: `num_draft_computed` is clamped to the verified length.
+    Per step: catch-up feeds the draft every token it has not seen yet (the whole prompt
+    after admission, then usually the 1-2 tokens emitted by the last verification), in
+    passes of at most `max_num_batched_tokens` tokens like chunked prefill, and samples
+    d_1; then k - 1 single-token passes sample d_2..d_k, replayed as CUDA graphs on GPU.
+    Draft K/V for rejected drafts is discarded the same way as the target's:
+    `num_draft_computed` is clamped to the verified length.
     """
 
     def __init__(self, config, target, kv) -> None:  # EngineConfig, ModelRunner, KVCacheManager
@@ -82,6 +83,7 @@ class DraftModelProposer:
 
         self.k = config.num_speculative_tokens
         self.max_model_len = config.max_model_len
+        self.max_tokens = config.max_num_batched_tokens  # per catch-up pass
         self.kv = kv
         self.device, self.backend = target.device, target.attn_backend
         path = resolve_model_path(config.draft_model)
@@ -142,19 +144,32 @@ class DraftModelProposer:
         if not active:
             return
 
-        # Catch-up pass: every token without draft K/V, through the pending token.
-        input_ids, positions, slots, seq_lens, query_lens = [], [], [], [], []
-        for seq, _ in active:
-            start, end = min(seq.num_draft_computed, seq.num_computed_tokens), seq.num_tokens
-            input_ids += seq.token_ids[start:end]
-            positions += range(start, end)
-            slots += self.kv.slots(seq, start, end - start)
-            seq_lens.append(end)
-            query_lens.append(end - start)
-        tables = [seq.block_table for seq, _ in active]
-        hidden = self._forward(input_ids, positions, slots, tables, seq_lens, query_lens)
-        last_rows = torch.tensor(query_lens, device=self.device).cumsum(0) - 1
-        tokens, probs = self._sample(hidden[last_rows], [seq.params for seq, _ in active])
+        # Catch-up: every token without draft K/V, through the pending token, chunked so no
+        # pass exceeds the token budget (a batch of fresh prompts can be very long).
+        starts = [min(seq.num_draft_computed, seq.num_computed_tokens) for seq, _ in active]
+        last_hidden: list[torch.Tensor | None] = [None] * len(active)
+        while any(start < seq.num_tokens for start, (seq, _) in zip(starts, active, strict=True)):
+            budget = self.max_tokens
+            input_ids, positions, slots, seq_lens, query_lens, tables = [], [], [], [], [], []
+            finishing: list[tuple[int, int]] = []  # (sequence index, row of its pending token)
+            for i, (seq, _) in enumerate(active):
+                start, end = starts[i], seq.num_tokens
+                n = min(end - start, budget)
+                if n <= 0:
+                    continue
+                input_ids += seq.token_ids[start : start + n]
+                positions += range(start, start + n)
+                slots += self.kv.slots(seq, start, n)
+                seq_lens.append(start + n)
+                query_lens.append(n)
+                tables.append(seq.block_table)
+                starts[i], budget = start + n, budget - n
+                if start + n == end:
+                    finishing.append((i, len(input_ids) - 1))
+            hidden = self._forward(input_ids, positions, slots, tables, seq_lens, query_lens)
+            for i, row in finishing:  # clone: graph outputs are overwritten by the next replay
+                last_hidden[i] = hidden[row].clone()
+        tokens, probs = self._sample(torch.stack(last_hidden), [seq.params for seq, _ in active])
         drafts = [[t] for t in tokens]
         draft_probs = [[probs[i]] if probs is not None else None for i in range(len(active))]
 
