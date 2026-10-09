@@ -99,16 +99,23 @@ def build(args: argparse.Namespace, method: str) -> LLMEngine:
 def run_waves(eng: LLMEngine, prompts: list[list[int]], batch: int, params: SamplingParams) -> dict:
     eng.num_draft_tokens = eng.num_accepted_tokens = eng.num_verify_steps = 0
     outputs: list[list[int]] = []
+    decode_rates: list[float] = []  # per request: tokens after the first / time after the first
     sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
     sync()
     start = time.perf_counter()
     for i in range(0, len(prompts), batch):
         ids = [eng.add_request(p, params) for p in prompts[i : i + batch]]
         done: dict[str, list[int]] = {}
+        first: dict[str, float] = {}
         while eng.has_unfinished():
-            for out in eng.step():
+            outs = eng.step()
+            now = time.perf_counter()
+            for out in outs:
+                first.setdefault(out.request_id, now)
                 if out.finished:
                     done[out.request_id] = out.output_token_ids
+                    if len(out.output_token_ids) > 1 and now > first[out.request_id]:
+                        decode_rates.append((len(out.output_token_ids) - 1) / (now - first[out.request_id]))
         outputs += [done[r] for r in ids]
     sync()
     elapsed = time.perf_counter() - start
@@ -118,6 +125,7 @@ def run_waves(eng: LLMEngine, prompts: list[list[int]], batch: int, params: Samp
         "elapsed_s": elapsed,
         "output_tokens": tokens,
         "tok_per_s": tokens / elapsed,
+        "decode_tok_per_s_per_req": sum(decode_rates) / len(decode_rates) if decode_rates else None,
         "draft_tokens": eng.num_draft_tokens,
         "accepted_tokens": eng.num_accepted_tokens,
         "acceptance": eng.num_accepted_tokens / eng.num_draft_tokens if eng.num_draft_tokens else None,
@@ -151,7 +159,11 @@ def main() -> None:
         chat = [chat_ids(eng, p) for p in CHAT]
         grounded = [chat_ids(eng, p) for p in grounded_prompts()]
         workloads = {"chat": chat, "grounded": grounded}
-        run_waves(eng, chat[:2], 2, SamplingParams(temperature=0, max_tokens=16))  # warm-up
+        # Warm-up: Triton compiles a kernel variant per new shape (verification passes are
+        # new shapes), which must not land inside a timed run.
+        for batch in args.batch_sizes:
+            for prompts in (chat, grounded):
+                run_waves(eng, (prompts * batch)[:batch], batch, SamplingParams(temperature=0, max_tokens=48))
         for name in args.workloads:
             prompts = workloads[name] * args.repeat
             for batch in args.batch_sizes:
@@ -168,14 +180,19 @@ def main() -> None:
                     "draft_model": args.draft_model if method == "draft" else None, "requests": n,
                     **{key: v for key, v in r.items() if key != "outputs"},
                     "speedup": r["tok_per_s"] / base["tok_per_s"] if base else None,
+                    "decode_speedup": (
+                        r["decode_tok_per_s_per_req"] / base["decode_tok_per_s_per_req"] if base else None
+                    ),
                     "identical_outputs": f"{same}/{n}" if same is not None else None,
                 }  # fmt: skip
                 rows.append(row)
                 acc = f"{row['acceptance']:.0%}" if row["acceptance"] is not None else "-"
                 tpv = f"{row['tokens_per_verify']:.2f}" if row["tokens_per_verify"] else "-"
                 spd = f"{row['speedup']:.2f}x" if row["speedup"] else "-"
+                dspd = f"{row['decode_speedup']:.2f}x" if row["decode_speedup"] else "-"
                 print(
                     f"{method:6} {name:9} batch {batch:3}  {row['tok_per_s']:8.1f} tok/s  speedup {spd:6} "
+                    f"per-request decode {row['decode_tok_per_s_per_req']:6.1f} tok/s ({dspd:6}) "
                     f"accept {acc:4}  tok/verify {tpv:5}  identical {row['identical_outputs']}",
                     flush=True,
                 )
