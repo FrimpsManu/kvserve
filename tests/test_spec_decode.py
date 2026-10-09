@@ -2,11 +2,14 @@
 
 import numpy as np
 import pytest
+from fastapi.testclient import TestClient
+from test_server import sse_events
 
 from kvserve import EngineConfig, LLMEngine, SamplingParams
 from kvserve.kv_cache import KVCacheManager
 from kvserve.scheduler import Scheduler
 from kvserve.sequence import Sequence
+from kvserve.server import create_app
 from kvserve.spec_decode import max_draft_tokens, ngram_lookup
 
 
@@ -208,3 +211,26 @@ class _Frozen:
 
     def propose(self, seqs):
         pass
+
+
+# ---- HTTP ----------------------------------------------------------------------------
+# Lives here, not in test_server.py, whose module-scoped server would stay loaded next
+# to these engines (CI runners have 16 GB).
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("engine_mode", ["process", "thread"])
+def test_speculative_stream_matches_plain_and_reports_acceptance(engine_mode):
+    body = {"prompt": "Repeat exactly: one two three four five six. one two three four", "max_tokens": 24,
+            "temperature": 0, "stream": True}  # fmt: skip
+
+    texts = []
+    for spec in ("none", "ngram"):
+        config = EngineConfig(device="cpu", num_kv_blocks=256, speculative_method=spec)
+        app = create_app(config, engine_mode=engine_mode)
+        with TestClient(app) as c, c.stream("POST", "/v1/completions", json=body) as r:
+            texts.append("".join(e["choices"][0]["text"] for e in sse_events(r)))
+            stats = c.get("/stats").json()
+    assert texts[0] == texts[1] and texts[0]
+    assert stats["info"]["speculative"] == "ngram lookup, 4 tokens per step"
+    assert 0 < stats["spec_accepted_tokens"] <= stats["spec_draft_tokens"]
