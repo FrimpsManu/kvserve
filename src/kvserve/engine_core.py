@@ -21,6 +21,7 @@ proportional to steps, not to tokens x requests.
 
 from __future__ import annotations
 
+import dataclasses
 import traceback
 from typing import Any
 
@@ -41,7 +42,7 @@ def _report(engine: LLMEngine, with_step: bool) -> dict[str, Any]:
     }
     step = engine.last_step
     if with_step and step is not None:
-        report["step"] = (step.num_tokens, step.num_seqs, step.num_preempted, step.duration_s, step.kv_usage)
+        report["step"] = dataclasses.astuple(step)
     return report
 
 

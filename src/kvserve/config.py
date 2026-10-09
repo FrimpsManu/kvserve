@@ -103,6 +103,14 @@ class EngineConfig:
     # Above ~512 tokens a step is compute bound: graphs save nothing and bucket padding
     # costs extra GEMM work (measured: 1025 tokens padded to 1280 ran 11% slower than eager).
     max_piecewise_tokens: int = 512
+    # Speculative decoding: "none", "ngram" (prompt lookup from the sequence's own
+    # context) or "draft" (a small model sharing the target's tokenizer, `draft_model`).
+    # Each decoding step proposes up to num_speculative_tokens drafts.
+    speculative_method: str = "none"
+    num_speculative_tokens: int = 4
+    draft_model: str = ""
+    ngram_max: int = 4  # longest suffix matched by ngram lookup
+    ngram_min: int = 2  # shortest
     seed: int = 0
 
     @property

@@ -6,12 +6,12 @@ from collections import Counter
 
 import torch
 
-from kvserve.attention import AttentionMetadata, TritonAttention, get_backend
+from kvserve.attention import AttentionMetadata, TorchAttention, TritonAttention, get_backend
 from kvserve.config import EngineConfig, ModelConfig, resolve_model_path
 from kvserve.cuda_graph import DecodeGraphRunner, PiecewiseGraphRunner
 from kvserve.kv_cache import KVCacheManager
 from kvserve.model import load_model
-from kvserve.sampler import sample
+from kvserve.sampler import rejection_sample, sample
 from kvserve.scheduler import SchedulerOutput
 from kvserve.sequence import Sequence
 
@@ -97,8 +97,13 @@ class ModelRunner:
         block_bytes = 2 * mc.num_layers * self.config.block_size * mc.num_kv_heads * mc.head_dim * itemsize
         return max(1, int(gb * 1024**3) // block_bytes)
 
-    def execute(self, sched: SchedulerOutput, kv: KVCacheManager) -> dict[Sequence, int]:
-        """Run one step. Returns sampled tokens for sequences whose context is now complete."""
+    def execute(self, sched: SchedulerOutput, kv: KVCacheManager) -> dict[Sequence, list[int]]:
+        """Run one step. Returns new tokens for sequences whose context is now complete.
+
+        A sequence with draft tokens (speculative decoding) gets its pending token and
+        drafts scored together; it emits its accepted drafts plus one sampled token.
+        Every other sequence emits exactly one token.
+        """
         input_ids: list[int] = []
         positions: list[int] = []
         slots: list[int] = []
@@ -109,14 +114,16 @@ class ModelRunner:
 
         for seq, n in sched.scheduled:
             start = seq.num_computed_tokens
-            tokens = seq.token_ids
+            drafts = seq.spec_token_ids
+            tokens = seq.token_ids + drafts if drafts else seq.token_ids
             input_ids += tokens[start : start + n]
             positions += range(start, start + n)
             slots += kv.slots(seq, start, n)
             seq_lens.append(start + n)
             query_lens.append(n)
-            if start + n == seq.num_tokens:  # chunked prefill not done yet -> no sample
-                sample_rows.append(len(input_ids) - 1)
+            if start + n == len(tokens):  # chunked prefill not done yet -> no sample
+                # The pending token's row, then one row per draft.
+                sample_rows += range(len(input_ids) - 1 - len(drafts), len(input_ids))
                 sample_seqs.append(seq)
 
         dev = self.device
@@ -137,33 +144,54 @@ class ModelRunner:
         if not sample_seqs:
             return {}
         logits = self.model.compute_logits(hidden[torch.tensor(sample_rows, device=dev)])
-        tokens = sample(logits, [s.params for s in sample_seqs], self.generator)
-        return dict(zip(sample_seqs, tokens, strict=True))
+        params = [s.params for s in sample_seqs]
+        if len(sample_rows) == len(sample_seqs):  # no drafts this step
+            tokens = sample(logits, params, self.generator)
+            return {seq: [t] for seq, t in zip(sample_seqs, tokens, strict=True)}
+        drafts = [s.spec_token_ids for s in sample_seqs]
+        draft_probs = [
+            s.spec_draft_probs[: len(s.spec_token_ids)] if s.spec_draft_probs is not None else None for s in sample_seqs
+        ]
+        emitted = rejection_sample(logits, drafts, params, self.generator, draft_probs)
+        return dict(zip(sample_seqs, emitted, strict=True))
 
     def _build_metadata(
         self, sched: SchedulerOutput, slots: list[int], seq_lens: list[int], query_lens: list[int]
     ) -> AttentionMetadata:
-        dev = self.device
-        max_blocks = max(len(seq.block_table) for seq, _ in sched.scheduled)
-        tables = [seq.block_table + [0] * (max_blocks - len(seq.block_table)) for seq, _ in sched.scheduled]
-        max_q = max(query_lens)
-        query_start_loc = [0]
-        for n in query_lens:
-            query_start_loc.append(query_start_loc[-1] + n)
-        meta = AttentionMetadata(
-            slot_mapping=torch.tensor(slots, dtype=torch.long, device=dev),
-            block_tables=torch.tensor(tables, dtype=torch.long, device=dev),
-            seq_lens=torch.tensor(seq_lens, device=dev),
-            query_lens=torch.tensor(query_lens, device=dev),
-            query_start_loc=torch.tensor(query_start_loc, device=dev),
-            max_seq_len=max(seq_lens),
-            max_query_len=max_q,
-        )
-        if self.attn_backend is not TritonAttention:  # padded layout for the torch reference only
-            q_gather, q_valid = [], []
-            for start, n in zip(query_start_loc, query_lens, strict=False):
-                q_gather.append(list(range(start, start + n)) + [0] * (max_q - n))
-                q_valid.append([True] * n + [False] * (max_q - n))
-            meta.q_gather = torch.tensor(q_gather, dtype=torch.long, device=dev)
-            meta.q_valid = torch.tensor(q_valid, device=dev)
-        return meta
+        tables = [seq.block_table for seq, _ in sched.scheduled]
+        return build_metadata(self.device, self.attn_backend, tables, slots, seq_lens, query_lens)
+
+
+def build_metadata(
+    device: torch.device,
+    backend: type[TorchAttention],
+    block_tables: list[list[int]],
+    slots: list[int],
+    seq_lens: list[int],
+    query_lens: list[int],
+) -> AttentionMetadata:
+    """Attention metadata for a flat batch: sequence i contributes query_lens[i] tokens."""
+    dev = device
+    max_blocks = max(len(t) for t in block_tables)
+    tables = [t + [0] * (max_blocks - len(t)) for t in block_tables]
+    max_q = max(query_lens)
+    query_start_loc = [0]
+    for n in query_lens:
+        query_start_loc.append(query_start_loc[-1] + n)
+    meta = AttentionMetadata(
+        slot_mapping=torch.tensor(slots, dtype=torch.long, device=dev),
+        block_tables=torch.tensor(tables, dtype=torch.long, device=dev),
+        seq_lens=torch.tensor(seq_lens, device=dev),
+        query_lens=torch.tensor(query_lens, device=dev),
+        query_start_loc=torch.tensor(query_start_loc, device=dev),
+        max_seq_len=max(seq_lens),
+        max_query_len=max_q,
+    )
+    if backend is not TritonAttention:  # padded layout for the torch reference only
+        q_gather, q_valid = [], []
+        for start, n in zip(query_start_loc, query_lens, strict=False):
+            q_gather.append(list(range(start, start + n)) + [0] * (max_q - n))
+            q_valid.append([True] * n + [False] * (max_q - n))
+        meta.q_gather = torch.tensor(q_gather, dtype=torch.long, device=dev)
+        meta.q_valid = torch.tensor(q_valid, device=dev)
+    return meta

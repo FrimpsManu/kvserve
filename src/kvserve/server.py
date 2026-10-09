@@ -77,6 +77,7 @@ def startup_banner(engine: EngineClient, url: str) -> str:
         f"  device    {info['device']} ({info['dtype']}), attention: {info['attention']}, cuda graphs: {graphs}\n"
         f"  kv cache  {info['kv_blocks']} blocks x {info['block_size']} = {info['kv_capacity_tokens']:,} tokens\n"
         f"  engine    {engine.mode} mode\n"
+        f"  speculate {info.get('speculative') or 'off'}\n"
         f"  try       {url}/docs   (interactive API)   {url}/metrics"
     )
 

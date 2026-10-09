@@ -235,7 +235,7 @@ def load_model(
 ) -> LlamaForCausalLM:
     with torch.device("meta"):
         model = LlamaForCausalLM(cfg, max_positions, backend)
-    model = model.to_empty(device=device).to(dtype)
+    model = model.to(dtype).to_empty(device=device)  # cast on meta: never materialize fp32 weights
     if cfg.tie_word_embeddings:
         model.lm_head.weight = model.embed_tokens.weight
     model.load_weights(path)

@@ -13,6 +13,7 @@ from kvserve.kv_cache import KVCacheManager
 from kvserve.model_runner import ModelRunner
 from kvserve.scheduler import Scheduler
 from kvserve.sequence import FinishReason, SamplingParams, Sequence
+from kvserve.spec_decode import DraftModelProposer, NgramProposer
 
 
 @dataclass
@@ -33,6 +34,9 @@ class StepStats:
     num_preempted: int
     duration_s: float
     kv_usage: float
+    num_draft_tokens: int = 0  # speculative decoding: drafts verified this step
+    num_accepted_tokens: int = 0  # of which accepted
+    num_verifying_seqs: int = 0  # sequences that verified drafts this step
 
 
 class LLMEngine:
@@ -43,9 +47,25 @@ class LLMEngine:
         self.kv = KVCacheManager(self.runner.num_kv_blocks, self.config.block_size, self.config.enable_prefix_caching)
         self.scheduler = Scheduler(self.kv, self.config.max_num_seqs, self.config.max_num_batched_tokens)
         self.eos_token_ids = set(self.runner.model_config.eos_token_ids)
+        self.proposer = self._make_proposer()
         self.requests: dict[str, Sequence] = {}
         self.last_step: StepStats | None = None
         self._ids = itertools.count()
+        self.num_draft_tokens = 0  # speculative decoding, lifetime totals
+        self.num_accepted_tokens = 0
+        self.num_verify_steps = 0  # sequence-steps that verified drafts
+
+    def _make_proposer(self) -> NgramProposer | DraftModelProposer | None:
+        c = self.config
+        if c.speculative_method == "none" or c.num_speculative_tokens < 1:
+            return None
+        if c.speculative_method == "ngram":
+            return NgramProposer(c.num_speculative_tokens, c.max_model_len, c.ngram_max, c.ngram_min)
+        if c.speculative_method == "draft":
+            if not c.draft_model:
+                raise ValueError("speculative_method 'draft' needs --draft-model")
+            return DraftModelProposer(c, self.runner, self.kv)
+        raise ValueError(f"unknown speculative_method {c.speculative_method!r} (none | ngram | draft)")
 
     def add_request(
         self, prompt: str | list[int], params: SamplingParams | None = None, request_id: str | None = None
@@ -74,20 +94,39 @@ class LLMEngine:
     def step(self) -> list[RequestOutput]:
         start = time.perf_counter()
         self.last_step = None
+        if self.proposer is not None:
+            decoding = [s for s in self.scheduler.running if s.num_tokens - s.num_computed_tokens == 1]
+            self.proposer.propose(decoding)
         sched = self.scheduler.schedule()
         if sched.is_empty:
             return []
         sampled = self.runner.execute(sched, self.kv)
 
         outputs = []
+        step_drafts = step_accepted = step_verifying = 0
         for seq, n in sched.scheduled:
-            seq.num_computed_tokens += n
-            self.kv.cache_full_blocks(seq)
-            token = sampled.get(seq)
-            if token is None:
+            num_drafts = len(seq.spec_token_ids)
+            seq.spec_token_ids, seq.spec_draft_probs = [], None
+            seq.num_computed_tokens += n - num_drafts
+            tokens = sampled.get(seq)
+            if tokens is None:
+                self.kv.cache_full_blocks(seq)
                 continue  # mid-prefill chunk
-            seq.append_token(token)
-            reason = self._check_stop(seq, token)
+            # Accepted drafts already have their K/V in the cache; the last token does not.
+            seq.num_computed_tokens += len(tokens) - 1
+            seq.num_draft_tokens += num_drafts
+            seq.num_accepted_tokens += len(tokens) - 1
+            step_drafts += num_drafts
+            step_accepted += len(tokens) - 1
+            step_verifying += num_drafts > 0
+            new_tokens, reason = [], None
+            for token in tokens:
+                seq.append_token(token)
+                new_tokens.append(token)
+                reason = self._check_stop(seq, token)
+                if reason is not None:
+                    break
+            self.kv.cache_full_blocks(seq)
             if reason is not None:
                 seq.finish_reason = reason
                 seq.finish_time = time.perf_counter()
@@ -96,7 +135,7 @@ class LLMEngine:
             outputs.append(
                 RequestOutput(
                     seq.request_id,
-                    [token],
+                    new_tokens,
                     seq.output_token_ids,
                     reason is not None,
                     reason,
@@ -104,8 +143,18 @@ class LLMEngine:
                     seq.num_cached_prompt_tokens,
                 )  # fmt: skip
             )
+        self.num_draft_tokens += step_drafts
+        self.num_accepted_tokens += step_accepted
+        self.num_verify_steps += step_verifying
         self.last_step = StepStats(
-            sched.num_tokens, len(sched.scheduled), sched.num_preempted, time.perf_counter() - start, self.kv.usage
+            sched.num_tokens,
+            len(sched.scheduled),
+            sched.num_preempted,
+            time.perf_counter() - start,
+            self.kv.usage,
+            step_drafts,
+            step_accepted,
+            step_verifying,
         )
         return outputs
 

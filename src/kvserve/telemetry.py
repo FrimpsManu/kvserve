@@ -37,6 +37,8 @@ class LiveStats:
         self.kv_usage = 0.0
         self.last_step_tokens = 0
         self.last_step_ms = 0.0
+        self.spec_draft_tokens = 0
+        self.spec_accepted_tokens = 0
 
     def add_prompt(self, num_tokens: int, num_cached: int) -> None:
         with self._lock:
@@ -66,6 +68,11 @@ class LiveStats:
                 "prefix_hit_rate": self.cached_prompt_tokens / self.prompt_tokens if self.prompt_tokens else 0.0,
                 "last_step_tokens": self.last_step_tokens,
                 "last_step_ms": self.last_step_ms,
+                "spec_draft_tokens": self.spec_draft_tokens,
+                "spec_accepted_tokens": self.spec_accepted_tokens,
+                "spec_acceptance_rate": (
+                    self.spec_accepted_tokens / self.spec_draft_tokens if self.spec_draft_tokens else 0.0
+                ),
             }
 
 
@@ -106,6 +113,11 @@ class Telemetry:
         metrics.step_tokens.observe(step.num_tokens)
         if step.num_preempted:
             metrics.preemptions_total.inc(step.num_preempted)
+        if step.num_draft_tokens:
+            metrics.spec_draft_tokens_total.inc(step.num_draft_tokens)
+            metrics.spec_accepted_tokens_total.inc(step.num_accepted_tokens)
+            self.stats.spec_draft_tokens += step.num_draft_tokens
+            self.stats.spec_accepted_tokens += step.num_accepted_tokens
         self.stats.last_step_tokens, self.stats.last_step_ms = step.num_tokens, step.duration_s * 1000
 
     def on_step_paths(self, paths: dict[str, int]) -> None:

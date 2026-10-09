@@ -4,7 +4,9 @@ Every step gets a token budget (`max_num_batched_tokens`). Running sequences are
 served first (in arrival order), so in-flight decodes are never starved by new
 prompts; leftover budget admits waiting requests, whose prompts may be split across
 several steps (chunked prefill). There is no separate "prefill phase": a sequence
-simply needs `num_tokens - num_computed_tokens` more tokens computed.
+simply needs `num_tokens - num_computed_tokens` more tokens computed. With speculative
+decoding, a decoding sequence's draft tokens are scheduled after its pending token and
+count against the same budget.
 
 If the KV pool runs out, the most recently admitted running sequence is preempted:
 its blocks are freed and it goes back to the front of the waiting queue, to be
@@ -61,7 +63,14 @@ class Scheduler:
         i = 0
         while i < len(self.running) and budget > 0:
             seq = self.running[i]
-            n = min(seq.num_tokens - seq.num_computed_tokens, budget)
+            pending = seq.num_tokens - seq.num_computed_tokens
+            # Draft tokens ride along with a decode's single pending token, budget allowing.
+            num_drafts = min(len(seq.spec_token_ids), budget - pending) if pending == 1 else 0
+            del seq.spec_token_ids[max(num_drafts, 0) :]
+            n = min(pending + len(seq.spec_token_ids), budget)
+            if seq.spec_token_ids and not self.kv.allocate_slots(seq, n):
+                seq.spec_token_ids = []  # no room for drafts: drop them before preempting anyone
+                n = pending
             while not self.kv.allocate_slots(seq, n):
                 victim = self.running.pop()  # newest admitted
                 self._preempt(victim)
@@ -91,6 +100,8 @@ class Scheduler:
     def _preempt(self, seq: Sequence) -> None:
         self.kv.free(seq)
         seq.num_computed_tokens = 0
+        seq.spec_token_ids = []
+        seq.num_draft_computed = 0
         seq.status = SequenceStatus.WAITING
         seq.num_preemptions += 1
         self.waiting.appendleft(seq)
