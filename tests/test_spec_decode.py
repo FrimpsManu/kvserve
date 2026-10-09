@@ -59,6 +59,16 @@ PROMPTS = [
 GREEDY = SamplingParams(temperature=0, max_tokens=40, ignore_eos=True)
 
 
+@pytest.fixture(autouse=True)
+def _free_memory():
+    # Engines hold reference cycles; collect them so tests that load two models (target
+    # + draft, or + an HF reference) don't stack on the previous test's (CI has 16 GB).
+    yield
+    import gc
+
+    gc.collect()
+
+
 def make_engine(**overrides) -> LLMEngine:
     return LLMEngine(EngineConfig(**{"device": "cpu", "num_kv_blocks": 256, **overrides}))
 

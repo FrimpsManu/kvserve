@@ -92,7 +92,10 @@ class DraftModelProposer:
             raise ValueError(
                 f"draft model vocab ({mc.vocab_size}) differs from the target's ({target.model_config.vocab_size})"
             )
-        self.model = load_model(path, mc, config.device, target.dtype, config.max_model_len, target.attn_backend)
+        if path == target.model_path:  # self-drafting (tests, debugging): share the weights
+            self.model = target.model
+        else:
+            self.model = load_model(path, mc, config.device, target.dtype, config.max_model_len, target.attn_backend)
         # Same block count as the target plus the scratch block, at the draft's (smaller) shape.
         self.kv_caches = torch.zeros(
             mc.num_layers, 2, target.num_kv_blocks + 1, config.block_size, mc.num_kv_heads, mc.head_dim,
