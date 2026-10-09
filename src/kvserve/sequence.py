@@ -60,6 +60,11 @@ class Sequence:
         self.num_cached_prompt_tokens = 0  # prefix-cache hits at admission
         self.block_hashes: list[bytes] = []  # hashes of this sequence's full blocks
         self.num_preemptions = 0
+        # Speculative decoding: draft tokens to verify in the next step (not yet part of
+        # the sequence), and lifetime counts for the acceptance rate.
+        self.spec_token_ids: list[int] = []
+        self.num_draft_tokens = 0
+        self.num_accepted_tokens = 0
 
         self.arrival_time = time.perf_counter()
         self.first_token_time: float | None = None

@@ -11,7 +11,7 @@ from kvserve.config import EngineConfig, ModelConfig, resolve_model_path
 from kvserve.cuda_graph import DecodeGraphRunner, PiecewiseGraphRunner
 from kvserve.kv_cache import KVCacheManager
 from kvserve.model import load_model
-from kvserve.sampler import sample
+from kvserve.sampler import rejection_sample, sample
 from kvserve.scheduler import SchedulerOutput
 from kvserve.sequence import Sequence
 
@@ -97,8 +97,13 @@ class ModelRunner:
         block_bytes = 2 * mc.num_layers * self.config.block_size * mc.num_kv_heads * mc.head_dim * itemsize
         return max(1, int(gb * 1024**3) // block_bytes)
 
-    def execute(self, sched: SchedulerOutput, kv: KVCacheManager) -> dict[Sequence, int]:
-        """Run one step. Returns sampled tokens for sequences whose context is now complete."""
+    def execute(self, sched: SchedulerOutput, kv: KVCacheManager) -> dict[Sequence, list[int]]:
+        """Run one step. Returns new tokens for sequences whose context is now complete.
+
+        A sequence with draft tokens (speculative decoding) gets its pending token and
+        drafts scored together; it emits its accepted drafts plus one sampled token.
+        Every other sequence emits exactly one token.
+        """
         input_ids: list[int] = []
         positions: list[int] = []
         slots: list[int] = []
@@ -109,14 +114,16 @@ class ModelRunner:
 
         for seq, n in sched.scheduled:
             start = seq.num_computed_tokens
-            tokens = seq.token_ids
+            drafts = seq.spec_token_ids
+            tokens = seq.token_ids + drafts if drafts else seq.token_ids
             input_ids += tokens[start : start + n]
             positions += range(start, start + n)
             slots += kv.slots(seq, start, n)
             seq_lens.append(start + n)
             query_lens.append(n)
-            if start + n == seq.num_tokens:  # chunked prefill not done yet -> no sample
-                sample_rows.append(len(input_ids) - 1)
+            if start + n == len(tokens):  # chunked prefill not done yet -> no sample
+                # The pending token's row, then one row per draft.
+                sample_rows += range(len(input_ids) - 1 - len(drafts), len(input_ids))
                 sample_seqs.append(seq)
 
         dev = self.device
@@ -137,8 +144,13 @@ class ModelRunner:
         if not sample_seqs:
             return {}
         logits = self.model.compute_logits(hidden[torch.tensor(sample_rows, device=dev)])
-        tokens = sample(logits, [s.params for s in sample_seqs], self.generator)
-        return dict(zip(sample_seqs, tokens, strict=True))
+        params = [s.params for s in sample_seqs]
+        if len(sample_rows) == len(sample_seqs):  # no drafts this step
+            tokens = sample(logits, params, self.generator)
+            return {seq: [t] for seq, t in zip(sample_seqs, tokens, strict=True)}
+        drafts = [s.spec_token_ids for s in sample_seqs]
+        emitted = rejection_sample(logits, drafts, params, self.generator)
+        return dict(zip(sample_seqs, emitted, strict=True))
 
     def _build_metadata(
         self, sched: SchedulerOutput, slots: list[int], seq_lens: list[int], query_lens: list[int]
